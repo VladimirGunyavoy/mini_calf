@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm:*)",
+      "Bash(python main.py:*)",
+      "Bash(python3.12:*)",
+      "Bash(dir:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(move physicsmath_update_manager.py physicssimulation_engine.py)",
+      "Bash(python -c:*)",
+      "Bash(python test_policies.py:*)",
+      "Bash(py -3.12:*)"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+ursina
+watchdog
+numpy
+torch
+matplotlib
+tqdm
