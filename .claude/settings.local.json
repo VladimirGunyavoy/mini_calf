@@ -9,7 +9,11 @@
       "Bash(move physicsmath_update_manager.py physicssimulation_engine.py)",
       "Bash(python -c:*)",
       "Bash(python test_policies.py:*)",
-      "Bash(py -3.12:*)"
+      "Bash(py -3.12:*)",
+      "Bash(python train_calf_visual.py:*)",
+      "Bash(timeout 60 python:*)",
+      "Bash(python test_agent_architecture.py:*)",
+      "Bash(ls:*)"
     ]
   }
 }

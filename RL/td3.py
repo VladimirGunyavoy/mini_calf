@@ -151,6 +151,32 @@ class TD3:
 
         return action
 
+    def select_action_batch(self, states, noise=0.0):
+        """
+        Select actions for a batch of states (optimized for visualization)
+
+        Parameters:
+        -----------
+        states : np.ndarray
+            Batch of states, shape (batch_size, state_dim)
+        noise : float
+            Exploration noise std (applied to all actions)
+
+        Returns:
+        --------
+        np.ndarray
+            Batch of actions, shape (batch_size, action_dim)
+        """
+        states_tensor = torch.FloatTensor(states).to(self.device)
+        with torch.no_grad():
+            actions = self.actor(states_tensor).cpu().data.numpy()
+
+        if noise > 0:
+            actions = actions + np.random.normal(0, noise, size=actions.shape)
+            actions = np.clip(actions, -self.max_action, self.max_action)
+
+        return actions
+
     def train(self, replay_buffer, batch_size=64):
         """Train the TD3 agent"""
         self.total_it += 1

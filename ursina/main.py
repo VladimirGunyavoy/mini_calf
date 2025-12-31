@@ -20,11 +20,11 @@ from managers import (
 # Импорт модуля physics (физические системы)
 from physics import PointSystem, SimulationEngine, VectorizedEnvironment
 from physics.policies import PDPolicy, TD3Policy, CALFPolicy, PolicyAdapter, RandomSwitchPolicy
-from visuals import PointVisual, SimpleTrail, MultiColorTrail
+from visuals import PointVisual, SimpleTrail
 from pathlib import Path
 
 # ВАЖНО: Устанавливаем размер и позицию окна ДО создания приложения Ursina
-WindowManager.setup_before_app(monitor="left")
+WindowManager.setup_before_app(monitor="main")
 
 app = Ursina()
 
@@ -171,31 +171,45 @@ print(f"   - RIGHT (MULTI): CALF (TD3 + PD fallback)")
 print(f"   - Initial conditions: SYNCHRONIZED (same seed)")
 print()
 
-# Векторизованные среды с одинаковым seed
+# Конфигурация траекторий (кольцевой буфер)
+trail_config = {
+    'max_length': 150,    # Размер кольцевого буфера (количество точек)
+    'decimation': 3,      # Каждую 3-ю точку добавлять
+    'point_size': 0.03    # Размер точек траектории
+}
+
+# Векторизованные среды с агентами и встроенными траекториями
 vec_env_td3 = VectorizedEnvironment(
     n_envs=N_AGENTS_PER_GROUP,
     policy=td3_policy,
     dt=0.01,
-    seed=SEED
+    seed=SEED,
+    object_manager=object_manager,
+    group_name="td3",
+    offset=(-8, 0, 0),  # LEFT side
+    color=Vec4(0.2, 0.3, 0.8, 1),  # Blue
+    trail_config=trail_config,
+    create_agents=True  # ВКЛЮЧАЕМ создание Agent объектов
 )
 
 vec_env_calf = VectorizedEnvironment(
     n_envs=N_AGENTS_PER_GROUP,
     policy=calf_policy,
     dt=0.01,
-    seed=SEED
+    seed=SEED,
+    object_manager=object_manager,
+    group_name="calf",
+    offset=(8, 0, 0),  # RIGHT side
+    color=Vec4(0.8, 0.4, 0.15, 1),  # Orange (fallback)
+    trail_config=trail_config,
+    create_agents=True  # ВКЛЮЧАЕМ создание Agent объектов
 )
 
 vec_env_td3.reset()
 vec_env_calf.reset()
 
-print(f"[OK] VectorizedEnvironments created with synchronized states")
-
-# Визуальные объекты и траектории
-points_td3 = []
-points_calf = []
-trails_td3 = []
-trails_calf = []
+print(f"[OK] VectorizedEnvironments created with {N_AGENTS_PER_GROUP} agents each")
+print(f"[OK] Each agent owns its trajectory (ring buffer with {trail_config['max_length']} points)")
 
 # Статистика для отслеживания
 stats = {
@@ -210,55 +224,10 @@ stats = {
     'step_counter': 0
 }
 
-# Создаем TD3 группу (BLUE, LEFT)
-for i in range(N_AGENTS_PER_GROUP):
-    state = vec_env_td3.envs[i].state
-    x, v = state[0], state[1]
-    pos = (x - 8, 0.1, v)  # LEFT side (shift by X=-8)
-
-    point = object_manager.create_object(
-        name=f'td3_point_{i}',
-        model='sphere',
-        position=pos,
-        scale=0.1,
-        color_val=Vec4(0.2, 0.3, 0.8, 1)  # Blue
-    )
-    points_td3.append(point)
-
-    trail = MultiColorTrail(
-        max_length=600,
-        decimation=2,
-        rebuild_frequency=10
-    )
-    trails_td3.append(trail)
-    trail.add_point(pos, mode='td3')
-
-print(f"[OK] Created TD3 group (BLUE, LEFT): {N_AGENTS_PER_GROUP} agents")
-
-# Создаем CALF группу (MULTI-COLOR, RIGHT)
-for i in range(N_AGENTS_PER_GROUP):
-    state = vec_env_calf.envs[i].state
-    x, v = state[0], state[1]
-    pos = (x + 8, 0.1, v)  # RIGHT side (shift by X=+8)
-
-    point = object_manager.create_object(
-        name=f'calf_point_{i}',
-        model='sphere',
-        position=pos,
-        scale=0.1,
-        color_val=Vec4(0.8, 0.4, 0.15, 1)  # Start orange (fallback)
-    )
-    points_calf.append(point)
-
-    trail = MultiColorTrail(
-        max_length=600,
-        decimation=2,
-        rebuild_frequency=10
-    )
-    trails_calf.append(trail)
-    trail.add_point(pos, mode='fallback')
-
-print(f"[OK] Created CALF group (MULTI-COLOR, RIGHT): {N_AGENTS_PER_GROUP} agents")
+# Агенты уже созданы внутри VectorizedEnvironment!
+# Каждый агент владеет своей траекторией (кольцевой буфер)
+print(f"[OK] TD3 group (BLUE, LEFT): {len(vec_env_td3.agents)} agents with trails")
+print(f"[OK] CALF group (MULTI-COLOR, RIGHT): {len(vec_env_calf.agents)} agents with trails")
 
 # Желтые сферы в центрах симуляций (цели)
 # TD3 goal (LEFT): x=-8, z=0
@@ -340,16 +309,14 @@ def update():
     general_object_manager.update_all()
 
     # 3. TD3 vs CALF: Update vectorized environments
+    # VectorizedEnvironment.step() автоматически обновляет агентов и их траектории!
     vec_env_td3.step()
     vec_env_calf.step()
     stats['step_counter'] += 1
 
-    # Update TD3 group (LEFT, x=-8)
-    for i in range(len(points_td3)):
+    # Update TD3 group - только статистика и сброс (визуализация обновляется автоматически)
+    for i in range(vec_env_td3.n_envs):
         state = vec_env_td3.envs[i].state
-        x, v = state[0], state[1]
-        position = (x - 8, 0.1, v)  # LEFT side
-
         distance = np.linalg.norm(state)
         stats['td3_distances'].append(distance)
 
@@ -358,28 +325,12 @@ def update():
             stats['td3_success'] += 1
             stats['td3_steps_to_goal'].append(stats['step_counter'])
             stats['td3_resets'] += 1
-            trails_td3[i].clear()
-            new_state = np.array([np.random.uniform(-2, 2), np.random.uniform(-0.5, 0.5)])
-            vec_env_td3.envs[i].state = new_state
+            # Используем новый метод reset_agent (автоматически очищает траекторию)
+            vec_env_td3.reset_agent(i)
 
-        points_td3[i].position = position
-        trails_td3[i].add_point(position, mode='td3')
-
-    # Update CALF group (RIGHT, x=+8)
-    for i in range(len(points_calf)):
+    # Update CALF group - только статистика и сброс (визуализация обновляется автоматически)
+    for i in range(vec_env_calf.n_envs):
         state = vec_env_calf.envs[i].state
-        x, v = state[0], state[1]
-        position = (x + 8, 0.1, v)  # RIGHT side
-        mode = vec_env_calf.policy.get_mode_for_env(i)
-
-        # Color based on CALF mode
-        if mode == 'td3':
-            points_calf[i].color = Vec4(0.2, 0.3, 0.8, 1)  # Blue
-        elif mode == 'relax':
-            points_calf[i].color = Vec4(0.2, 0.6, 0.3, 1)  # Green
-        elif mode == 'fallback':
-            points_calf[i].color = Vec4(0.8, 0.4, 0.15, 1)  # Orange
-
         distance = np.linalg.norm(state)
         stats['calf_distances'].append(distance)
 
@@ -388,12 +339,8 @@ def update():
             stats['calf_success'] += 1
             stats['calf_steps_to_goal'].append(stats['step_counter'])
             stats['calf_resets'] += 1
-            trails_calf[i].clear()
-            new_state = np.array([np.random.uniform(-2, 2), np.random.uniform(-0.5, 0.5)])
-            vec_env_calf.envs[i].state = new_state
-
-        points_calf[i].position = position
-        trails_calf[i].add_point(position, mode=mode)
+            # Используем новый метод reset_agent (автоматически очищает траекторию)
+            vec_env_calf.reset_agent(i)
 
     # Update statistics display
     td3_avg_dist = np.mean(stats['td3_distances'][-100:]) if stats['td3_distances'] else 0

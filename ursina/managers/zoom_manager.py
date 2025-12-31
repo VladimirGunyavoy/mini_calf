@@ -123,10 +123,10 @@ class ZoomManager:
                         self.b_translation,
                         spores_scale=self.objects_scale
                     )
-            except (AssertionError, AttributeError, RuntimeError) as e:
+            except (AssertionError, AttributeError, RuntimeError, Exception) as e:
                 # Объект невалиден - удаляем из списка
                 if self.auto_print_enabled:
-                    print(f"Удален невалидный объект: {name}")
+                    print(f"Удален невалидный объект: {name} (Error: {type(e).__name__})")
                 del self.objects[name]
 
     def change_zoom(self, sign: int) -> None:

@@ -53,6 +53,14 @@ class CriticHeatmap:
 
         self.step_counter = 0
         self.surface_entity = None
+        self.triangles_cached = None  # Cache triangle topology (doesn't change)
+
+        # Performance metrics
+        self.update_count = 0
+        self.total_update_time = 0.0
+        self.avg_update_time = 0.0
+        self.ema_update_time = 0.0  # Exponential moving average
+        self.ema_alpha = 0.1  # Smoothing factor for EMA (lower = smoother)
 
         # Create grid
         self.x_grid, self.v_grid = self._create_grid()
@@ -118,69 +126,80 @@ class CriticHeatmap:
 
         return q_values
 
-    def _create_surface_mesh(self):
-        """Create mesh for 3D surface"""
-        vertices = []
-        colors = []
+    def _create_triangles_topology(self):
+        """Create triangle topology (called once, then cached)"""
+        if self.triangles_cached is not None:
+            return self.triangles_cached
+
         triangles = []
-
-        # Square Q-values for normalization (same as height computation)
-        q_squared = self.q_values ** 2
-        
-        # Normalize squared Q-values to [0, 1] for color
-        if self.q_max > self.q_min:
-            q_normalized = (q_squared - self.q_min) / (self.q_max - self.q_min)
-            q_normalized = np.clip(q_normalized, 0.0, 1.0)
-            # INVERT: to match inverted height (high at origin)
-            q_normalized = 1.0 - q_normalized
-        else:
-            q_normalized = np.zeros_like(self.q_values)
-
-        # Create vertices with height based on Q-value
-        vertex_index = 0
-        vertex_map = {}
-
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                x = self.x_grid[i, j]
-                v = self.v_grid[i, j]
-                
-                # Get raw Q-value for this grid point
-                q_raw = self.q_values[i, j]
-                
-                # Compute height with epsilon offset (surface above ground)
-                height = self._compute_height_from_q(q_raw, surface_offset=self.surface_epsilon)
-                
-                # Get normalized value for color (from squared and normalized)
-                q_norm_color = q_normalized[i, j]
-
-                # Position in 3D space (применяем трансформацию зума)
-                real_pos = np.array([x, height, v])
-                transformed_pos = real_pos * self.a_transformation + self.b_translation
-                position = Vec3(transformed_pos[0], transformed_pos[1], transformed_pos[2])
-                vertices.append(position)
-
-                # Color: blue (low Q^2) -> red (high Q^2)
-                color = self._q_to_color(q_norm_color)
-                colors.append(color)
-
-                vertex_map[(i, j)] = vertex_index
-                vertex_index += 1
 
         # Create triangles (2 per grid cell) - counter-clockwise for correct facing
         for i in range(self.grid_size - 1):
             for j in range(self.grid_size - 1):
+                # Vertex indices: vertex at (i,j) has index i*grid_size + j
+                v0 = i * self.grid_size + j
+                v1 = i * self.grid_size + (j + 1)
+                v2 = (i + 1) * self.grid_size + j
+                v3 = (i + 1) * self.grid_size + (j + 1)
+
                 # Triangle 1 (reversed winding order for top-facing)
-                v0 = vertex_map[(i, j)]
-                v1 = vertex_map[(i, j + 1)]
-                v2 = vertex_map[(i + 1, j)]
                 triangles.extend([v0, v1, v2])
 
                 # Triangle 2 (reversed winding order for top-facing)
-                v0 = vertex_map[(i + 1, j)]
-                v1 = vertex_map[(i, j + 1)]
-                v2 = vertex_map[(i + 1, j + 1)]
-                triangles.extend([v0, v1, v2])
+                triangles.extend([v2, v1, v3])
+
+        self.triangles_cached = triangles
+        return triangles
+
+    def _compute_vertices_and_colors(self):
+        """Compute vertices and colors from current Q-values (vectorized)"""
+        # Square Q-values for normalization (same as height computation)
+        q_squared = self.q_values ** 2
+
+        # Normalize squared Q-values to [0, 1] for color
+        if self.q_max > self.q_min:
+            q_normalized = (q_squared - self.q_min) / (self.q_max - self.q_min)
+            q_normalized = np.clip(q_normalized, 0.0, 1.0)
+            # NO INVERSION: low at origin (pit), high far away
+            # q_normalized stays as is
+        else:
+            q_normalized = np.zeros_like(self.q_values)
+
+        # Vectorized height computation
+        # Normalize raw Q-values: (q^2 - min) / (max - min)
+        if self.q_max > self.q_min:
+            q_squared_normalized = (q_squared - self.q_min) / (self.q_max - self.q_min)
+        else:
+            q_squared_normalized = np.zeros_like(q_squared)
+
+        q_squared_normalized = np.clip(q_squared_normalized, 0.0, 1.0)
+
+        # Compute heights for all points at once
+        heights = q_squared_normalized * self.height_scale + self.surface_epsilon
+
+        # Flatten grids for vectorized operations
+        x_flat = self.x_grid.flatten()
+        v_flat = self.v_grid.flatten()
+        heights_flat = heights.flatten()
+
+        # Create position array (N x 3): [x, height, v]
+        positions = np.stack([x_flat, heights_flat, v_flat], axis=1)
+
+        # Apply zoom transformation (vectorized)
+        positions_transformed = positions * self.a_transformation + self.b_translation
+
+        # Convert to Vec3 list
+        vertices = [Vec3(pos[0], pos[1], pos[2]) for pos in positions_transformed]
+
+        # Compute colors (vectorized)
+        colors = self._q_to_color_vectorized(q_normalized)
+
+        return vertices, colors
+
+    def _create_surface_mesh(self):
+        """Create mesh for 3D surface (initial creation only)"""
+        vertices, colors = self._compute_vertices_and_colors()
+        triangles = self._create_triangles_topology()
 
         # Create mesh
         mesh = Mesh(
@@ -192,35 +211,115 @@ class CriticHeatmap:
 
         return mesh
 
-    def _q_to_color(self, q_normalized):
-        """Convert normalized Q-value to color (blue -> cyan -> green -> yellow -> red)"""
-        # Rainbow colormap: blue (0) -> red (1)
-        if q_normalized < 0.25:
-            # Blue -> Cyan
-            t = q_normalized / 0.25
-            r = 0.0
-            g = t * 0.5
-            b = 1.0
-        elif q_normalized < 0.5:
-            # Cyan -> Green
-            t = (q_normalized - 0.25) / 0.25
-            r = 0.0
-            g = 0.5 + t * 0.5
-            b = 1.0 - t
-        elif q_normalized < 0.75:
-            # Green -> Yellow
-            t = (q_normalized - 0.5) / 0.25
-            r = t
-            g = 1.0
-            b = 0.0
-        else:
-            # Yellow -> Red
-            t = (q_normalized - 0.75) / 0.25
-            r = 1.0
-            g = 1.0 - t
-            b = 0.0
+    def _update_surface_mesh(self):
+        """Update existing mesh with new vertices and colors (fast path)"""
+        if self.surface_entity is None or self.surface_entity.model is None:
+            # No existing mesh, create new one
+            self.rebuild()
+            return
 
-        return Vec4(r, g, b, 1.0)  # Fully opaque
+        # Compute new vertices and colors
+        vertices, colors = self._compute_vertices_and_colors()
+
+        # Update the mesh in-place
+        self.surface_entity.model.vertices = vertices
+        self.surface_entity.model.colors = colors
+        self.surface_entity.model.generate()  # Regenerate GPU buffers
+
+    def _q_to_color_vectorized(self, q_normalized_array):
+        """
+        Convert normalized Q-values to colors (vectorized version)
+        Enhanced low-range gradient with alternating light/dark shades:
+        Light Violet -> Dark Violet -> Light Blue -> Dark Blue -> Cyan -> Green -> Yellow -> Orange -> Red
+
+        Parameters:
+        -----------
+        q_normalized_array : np.ndarray
+            Array of normalized Q-values [0, 1], shape (grid_size, grid_size)
+
+        Returns:
+        --------
+        list
+            List of Vec4 colors, length (grid_size * grid_size)
+        """
+        # Flatten for easier processing
+        q_flat = q_normalized_array.flatten()
+        n = len(q_flat)
+
+        # Initialize RGB arrays
+        r = np.zeros(n)
+        g = np.zeros(n)
+        b = np.zeros(n)
+
+        # 10-color gradient with more detail in low range (0.0 - 0.4)
+
+        # Light Violet (0.0 to 0.08) - RGB(200, 150, 255)
+        mask1 = q_flat < 0.08
+        t1 = q_flat[mask1] / 0.08
+        r[mask1] = 0.78
+        g[mask1] = 0.59
+        b[mask1] = 1.0
+
+        # Dark Violet (0.08 to 0.16) - RGB(100, 50, 180)
+        mask2 = (q_flat >= 0.08) & (q_flat < 0.16)
+        t2 = (q_flat[mask2] - 0.08) / 0.08
+        r[mask2] = 0.39
+        g[mask2] = 0.20
+        b[mask2] = 0.71
+
+        # Light Blue (0.16 to 0.24) - RGB(100, 150, 255)
+        mask3 = (q_flat >= 0.16) & (q_flat < 0.24)
+        t3 = (q_flat[mask3] - 0.16) / 0.08
+        r[mask3] = 0.39
+        g[mask3] = 0.59
+        b[mask3] = 1.0
+
+        # Dark Blue (0.24 to 0.32) - RGB(0, 0, 180)
+        mask4 = (q_flat >= 0.24) & (q_flat < 0.32)
+        t4 = (q_flat[mask4] - 0.24) / 0.08
+        r[mask4] = 0.0
+        g[mask4] = 0.0
+        b[mask4] = 0.71
+
+        # Cyan (0.32 to 0.45) - RGB(0, 200, 255)
+        mask5 = (q_flat >= 0.32) & (q_flat < 0.45)
+        t5 = (q_flat[mask5] - 0.32) / 0.13
+        r[mask5] = 0.0
+        g[mask5] = 0.78
+        b[mask5] = 1.0
+
+        # Green (0.45 to 0.6)
+        mask6 = (q_flat >= 0.45) & (q_flat < 0.6)
+        t6 = (q_flat[mask6] - 0.45) / 0.15
+        r[mask6] = 0.0
+        g[mask6] = 1.0
+        b[mask6] = 1.0 - t6 * 1.0
+
+        # Yellow (0.6 to 0.75)
+        mask7 = (q_flat >= 0.6) & (q_flat < 0.75)
+        t7 = (q_flat[mask7] - 0.6) / 0.15
+        r[mask7] = t7 * 1.0
+        g[mask7] = 1.0
+        b[mask7] = 0.0
+
+        # Orange (0.75 to 0.875)
+        mask8 = (q_flat >= 0.75) & (q_flat < 0.875)
+        t8 = (q_flat[mask8] - 0.75) / 0.125
+        r[mask8] = 1.0
+        g[mask8] = 1.0 - t8 * 0.5
+        b[mask8] = 0.0
+
+        # Red (0.875 to 1.0)
+        mask9 = q_flat >= 0.875
+        t9 = (q_flat[mask9] - 0.875) / 0.125
+        r[mask9] = 1.0
+        g[mask9] = 0.5 - t9 * 0.5
+        b[mask9] = 0.0
+
+        # Create Vec4 array with semi-transparency (alpha=0.6)
+        colors = [Vec4(r[i], g[i], b[i], 0.6) for i in range(n)]
+
+        return colors
 
     def update(self, step):
         """
@@ -231,23 +330,51 @@ class CriticHeatmap:
         step : int
             Current simulation step
         """
+        import time
+
         self.step_counter = step
 
         # Update only at specified frequency
         if step % self.update_frequency != 0:
             return
 
+        # Start timing
+        start_time = time.perf_counter()
+
         # Compute new Q-values
         self.q_values = self._compute_q_values()
 
-        # Rebuild surface
-        self.rebuild()
+        # Update surface (fast path - no destroy/create)
+        if self.surface_entity is None:
+            # First time, create the surface
+            self.rebuild()
+        else:
+            # Update existing mesh in-place
+            self._update_surface_mesh()
+
+        # End timing and update metrics
+        end_time = time.perf_counter()
+        update_time = end_time - start_time
+
+        # Update counters
+        self.update_count += 1
+        self.total_update_time += update_time
+
+        # Arithmetic mean
+        self.avg_update_time = self.total_update_time / self.update_count
+
+        # Exponential moving average (more recent updates have higher weight)
+        if self.update_count == 1:
+            self.ema_update_time = update_time
+        else:
+            self.ema_update_time = self.ema_alpha * update_time + (1 - self.ema_alpha) * self.ema_update_time
 
     def rebuild(self):
-        """Rebuild the surface mesh"""
-        # Destroy old surface
+        """Rebuild the surface mesh (full recreate - used for zoom transform or initial creation)"""
+        # Destroy old surface (mesh уничтожится автоматически)
         if self.surface_entity is not None:
             destroy(self.surface_entity)
+            self.surface_entity = None
 
         # Create new surface
         mesh = self._create_surface_mesh()
@@ -255,7 +382,7 @@ class CriticHeatmap:
             model=mesh,
             double_sided=False,  # Only visible from top (prevents z-fighting)
             unlit=True,  # Don't apply lighting (use vertex colors)
-            render_queue=0  # Render first to avoid flickering
+            alpha=0.6  # Semi-transparent surface
         )
 
     def clear(self):
@@ -267,6 +394,31 @@ class CriticHeatmap:
     def get_q_range(self):
         """Get current Q-value range"""
         return self.q_min, self.q_max
+
+    def get_performance_stats(self):
+        """
+        Get performance statistics for heatmap updates
+
+        Returns:
+        --------
+        dict
+            Dictionary with performance metrics:
+            - update_count: number of updates
+            - avg_time_ms: average update time in milliseconds
+            - ema_time_ms: EMA update time in milliseconds
+            - avg_fps: average FPS (1/avg_time)
+            - ema_fps: EMA FPS (1/ema_time)
+        """
+        avg_fps = 1.0 / self.avg_update_time if self.avg_update_time > 0 else 0
+        ema_fps = 1.0 / self.ema_update_time if self.ema_update_time > 0 else 0
+
+        return {
+            'update_count': self.update_count,
+            'avg_time_ms': self.avg_update_time * 1000,
+            'ema_time_ms': self.ema_update_time * 1000,
+            'avg_fps': avg_fps,
+            'ema_fps': ema_fps
+        }
     
     def _compute_height_from_q(self, q_value, surface_offset=0.0):
         """
@@ -296,8 +448,8 @@ class CriticHeatmap:
         # Clamp to [0, 1]
         normalized = np.clip(normalized, 0.0, 1.0)
         
-        # INVERT: maximum at origin (0,0), minimum far away
-        normalized = 1.0 - normalized
+        # NO INVERSION: minimum at origin (0,0), maximum far away (pit shape)
+        # normalized stays as is
         
         # Scale and apply offset
         height = normalized * self.height_scale + surface_offset
@@ -307,7 +459,7 @@ class CriticHeatmap:
     def get_q_value_for_state(self, state, use_cached=True):
         """
         Get Q-value height for a specific state (for agents/goal positioning)
-        
+
         Parameters:
         -----------
         state : np.ndarray
@@ -315,7 +467,7 @@ class CriticHeatmap:
         use_cached : bool
             If True, interpolate from cached grid Q-values (synchronized with surface)
             If False, query critic directly (may be out of sync with surface)
-        
+
         Returns:
         --------
         float
@@ -329,14 +481,54 @@ class CriticHeatmap:
             with torch.no_grad():
                 state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.td3_agent.device)
                 action_tensor = torch.zeros(1, self.td3_agent.action_dim).to(self.td3_agent.device)
-                
+
                 q1, q2 = self.td3_agent.critic(state_tensor, action_tensor)
                 q_value = torch.min(q1, q2).cpu().numpy()[0, 0]
-        
+
         # Use centralized height computation (no offset for agents)
         height = self._compute_height_from_q(q_value, surface_offset=0.0)
-        
+
         return height
+
+    def get_q_value_for_states_batch(self, states, use_cached=True):
+        """
+        Get Q-value heights for a batch of states (optimized for multiple agents)
+
+        Parameters:
+        -----------
+        states : np.ndarray
+            Batch of state vectors, shape (batch_size, 2) where each is [x, v]
+        use_cached : bool
+            If True, interpolate from cached grid Q-values (synchronized with surface)
+            If False, query critic directly (may be out of sync with surface)
+
+        Returns:
+        --------
+        np.ndarray
+            Heights for agent positioning, shape (batch_size,)
+        """
+        batch_size = len(states)
+        heights = np.zeros(batch_size)
+
+        if use_cached:
+            # Vectorized interpolation from cached grid
+            for i, state in enumerate(states):
+                q_value = self._interpolate_q_from_grid(state)
+                heights[i] = self._compute_height_from_q(q_value, surface_offset=0.0)
+        else:
+            # Batch query critic directly
+            with torch.no_grad():
+                states_tensor = torch.FloatTensor(states).to(self.td3_agent.device)
+                actions_tensor = torch.zeros(batch_size, self.td3_agent.action_dim).to(self.td3_agent.device)
+
+                q1, q2 = self.td3_agent.critic(states_tensor, actions_tensor)
+                q_values = torch.min(q1, q2).cpu().numpy().flatten()
+
+            # Compute heights for all states
+            for i, q_value in enumerate(q_values):
+                heights[i] = self._compute_height_from_q(q_value, surface_offset=0.0)
+
+        return heights
     
     def _interpolate_q_from_grid(self, state):
         """

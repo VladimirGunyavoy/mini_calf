@@ -2,6 +2,10 @@
 Вотчер для автоматической перезагрузки приложения
 Перезапускает приложение ТОЛЬКО когда оно закрыто пользователем (exit code 0)
 НЕ отслеживает изменения файлов - полностью убрана вся логика отслеживания
+
+Использование:
+    python watcher.py                  # запускает main.py (по умолчанию)
+    python watcher.py train_calf_visual.py  # запускает указанный скрипт
 """
 
 import time
@@ -12,20 +16,21 @@ import sys
 # --- НАСТРОЙКИ ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # Папка ursina
 PYTHON_EXECUTABLE = sys.executable
-SCRIPT_TO_RUN = "main.py"
+DEFAULT_SCRIPT = "main.py"
 # --- КОНЕЦ НАСТРОЕК ---
 
 class ScriptRunner:
-    def __init__(self):
+    def __init__(self, script_name=None):
         self.process = None
-        self.script_path = os.path.join(SCRIPT_DIR, SCRIPT_TO_RUN)
+        self.script_name = script_name or DEFAULT_SCRIPT
+        self.script_path = os.path.join(SCRIPT_DIR, self.script_name)
         self.running = True
         self.restart_delay = 1.0
         
     def run_script(self):
         """Запуск скрипта"""
         if not os.path.exists(self.script_path):
-            print(f"[WATCHER] Ошибка: Скрипт {SCRIPT_TO_RUN} не найден")
+            print(f"[WATCHER] Ошибка: Скрипт {self.script_name} не найден")
             return False
             
         try:
@@ -39,7 +44,7 @@ class ScriptRunner:
                     self.process.kill()
                     self.process.wait()
             
-            print(f"[WATCHER] Запуск скрипта: {SCRIPT_TO_RUN}")
+            print(f"[WATCHER] Запуск скрипта: {self.script_name}")
             self.process = subprocess.Popen(
                 [PYTHON_EXECUTABLE, "-u", self.script_path],
                 cwd=SCRIPT_DIR
@@ -79,17 +84,20 @@ class ScriptRunner:
 
 def main():
     """Основная функция - только перезапуск при закрытии игры"""
+    # Получаем имя скрипта из аргументов командной строки
+    script_name = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SCRIPT
+    
     print("=" * 60)
     print("WATCHER - Перезапуск только при закрытии игры")
     print("=" * 60)
-    print(f"Скрипт: {SCRIPT_TO_RUN}")
+    print(f"Скрипт: {script_name}")
     print("=" * 60)
     print("Вотчер НЕ отслеживает изменения файлов")
     print("Перезапуск только когда вы закрываете игру (Q/Escape)")
     print("Нажмите Ctrl+C для остановки вотчера")
     print()
     
-    runner = ScriptRunner()
+    runner = ScriptRunner(script_name)
     
     # Запускаем скрипт первый раз
     if not runner.run_script():

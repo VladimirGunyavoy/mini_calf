@@ -20,7 +20,7 @@ class MultiColorTrail:
     - Автоматическая группировка последовательных точек по режиму
     - Максимальная длина (старые точки удаляются)
     - Decimation (скважность) - добавлять каждую N-ую точку
-    - Оптимизированная перестройка
+    - ОПТИМИЗАЦИЯ: переиспользование Entity вместо destroy/create
     """
     
     # Цвета режимов (Vec4 для надежности)
@@ -29,6 +29,9 @@ class MultiColorTrail:
         'relax': Vec4(0.2, 0.6, 0.3, 1),    # Зеленый
         'fallback': Vec4(0.8, 0.4, 0.15, 1) # Оранжевый
     }
+    
+    # Максимальное количество сегментов (режимов переключается не так много)
+    MAX_SEGMENTS = 20
     
     def __init__(self, max_length=200, decimation=1, rebuild_frequency=5):
         """
@@ -49,8 +52,12 @@ class MultiColorTrail:
         self.positions = []  # List[Vec3] - реальные позиции (без зума)
         self.modes = []      # List[str] - 'td3', 'relax', 'fallback'
         
-        # Entity для каждого сегмента
-        self.segments = []  # List[Entity]
+        # Пул Entity для переиспользования (создаём один раз!)
+        self.segment_pool = []
+        for _ in range(self.MAX_SEGMENTS):
+            seg = Entity(model=None, visible=False)
+            self.segment_pool.append(seg)
+        self.active_segments = 0  # Сколько сегментов сейчас используется
         
         # Счетчики
         self.step_counter = 0
@@ -102,36 +109,38 @@ class MultiColorTrail:
     def rebuild(self):
         """
         Перестроить визуализацию траектории.
-        Создает отдельный Entity для каждого сегмента одного режима.
+        ОПТИМИЗАЦИЯ: переиспользуем Entity из пула вместо destroy/create.
         """
-        # Удаляем старые сегменты
-        for seg in self.segments:
-            destroy(seg)
-        self.segments = []
+        # Скрываем все сегменты из пула
+        for seg in self.segment_pool:
+            seg.visible = False
         
         # Нужно минимум 2 точки
         if len(self.positions) < 2:
+            self.active_segments = 0
             return
         
         # Группируем по режимам
         groups = self._group_by_mode()
         
-        # Применяем трансформацию зума к точкам
-        transformed_groups = []
-        for mode, points in groups:
-            transformed_points = [self._apply_transform_to_point(p) for p in points]
-            transformed_groups.append((mode, transformed_points))
+        # Ограничиваем количество групп размером пула
+        groups = groups[:self.MAX_SEGMENTS]
         
-        # Создаем Entity для каждой группы
-        for mode, points in transformed_groups:
-            if len(points) >= 2:
-                # Цвет уже с alpha в Vec4(r, g, b, a)
+        # Применяем трансформацию зума к точкам и обновляем Entity
+        segment_idx = 0
+        for mode, points in groups:
+            if len(points) >= 2 and segment_idx < self.MAX_SEGMENTS:
+                transformed_points = [self._apply_transform_to_point(p) for p in points]
                 trail_color = self.MODE_COLORS.get(mode, Vec4(1, 1, 1, 1))
-                seg = Entity(
-                    model=Mesh(vertices=points, mode='line', thickness=3),
-                    color=trail_color
-                )
-                self.segments.append(seg)
+                
+                # Переиспользуем Entity из пула
+                seg = self.segment_pool[segment_idx]
+                seg.model = Mesh(vertices=transformed_points, mode='line', thickness=3)
+                seg.color = trail_color
+                seg.visible = True
+                segment_idx += 1
+        
+        self.active_segments = segment_idx
     
     def _apply_transform_to_point(self, point):
         """Применить трансформацию зума к точке"""
@@ -190,17 +199,17 @@ class MultiColorTrail:
     
     def clear(self):
         """
-        Очистить траекторию
+        Очистить траекторию (скрыть все сегменты, не удалять)
         """
         self.positions = []
         self.modes = []
         self.step_counter = 0
         self.rebuild_counter = 0
+        self.active_segments = 0
         
-        # Удаляем все сегменты
-        for seg in self.segments:
-            destroy(seg)
-        self.segments = []
+        # Скрываем все сегменты (не destroy!)
+        for seg in self.segment_pool:
+            seg.visible = False
     
     def force_rebuild(self):
         """
@@ -232,7 +241,16 @@ class MultiColorTrail:
     @property
     def enabled(self):
         """Для совместимости с ZoomManager"""
-        return len(self.segments) > 0
+        return self.active_segments > 0
+    
+    def destroy_pool(self):
+        """Полностью уничтожить пул Entity (при завершении)"""
+        for seg in self.segment_pool:
+            try:
+                destroy(seg)
+            except:
+                pass
+        self.segment_pool = []
     
     def __del__(self):
         """Очистка при удалении объекта"""
@@ -240,9 +258,14 @@ class MultiColorTrail:
             import sys
             # Проверяем что Python еще не завершается
             if sys.meta_path is not None:
-                self.clear()
+                self.destroy_pool()
         except:
             # Игнорируем любые ошибки при shutdown
             pass
+
+
+
+
+
 
 

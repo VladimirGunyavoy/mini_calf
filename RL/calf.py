@@ -2,7 +2,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from td3 import TD3, ReplayBuffer
+
+# Support both direct and package imports
+try:
+    from td3 import TD3, ReplayBuffer
+except ImportError:
+    from RL.td3 import TD3, ReplayBuffer
 
 
 class CALFController:
@@ -148,14 +153,27 @@ class CALFController:
 
         return lyapunov_decrease and k_infinity_bounds
 
-    def update_certificate(self, state, action):
-        """Обновить сертифицированную тройку (s†, a†, q†)"""
-        state_tensor = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-        action_tensor = torch.FloatTensor(action.reshape(1, -1)).to(self.device)
+    def update_certificate(self, state, action, q_value=None):
+        """
+        Обновить сертифицированную тройку (s†, a†, q†)
+        
+        Parameters:
+        -----------
+        state : np.ndarray
+            State vector
+        action : np.ndarray
+            Action vector  
+        q_value : float, optional
+            Pre-computed Q-value (to avoid redundant forward pass in batch mode)
+        """
+        if q_value is None:
+            # Fallback: compute Q-value (для одиночных вызовов select_action)
+            state_tensor = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
+            action_tensor = torch.FloatTensor(action.reshape(1, -1)).to(self.device)
 
-        with torch.no_grad():
-            q_value, _ = self.td3.critic(state_tensor, action_tensor)
-            q_value = q_value.item()
+            with torch.no_grad():
+                q_value_tensor, _ = self.td3.critic(state_tensor, action_tensor)
+                q_value = q_value_tensor.item()
 
         self.s_cert = state.copy()
         self.a_cert = action.copy()
@@ -209,6 +227,107 @@ class CALFController:
 
         return action
 
+    def select_action_batch(self, states, exploration_noise=0.0, return_modes=False, update_state=False):
+        """
+        Batch version of select_action for efficient multi-agent processing
+        
+        Key optimizations:
+        1. Batch actor inference (1 GPU call instead of N)
+        2. Batch critic inference (1 GPU call instead of N)
+        3. Cached Q-values for update_certificate (avoid N redundant GPU calls)
+        
+        Parameters:
+        -----------
+        states : np.ndarray
+            Batch of states, shape (batch_size, state_dim)
+        exploration_noise : float
+            Exploration noise std
+        return_modes : bool
+            If True, return (actions, modes) where modes is list of action sources
+        update_state : bool
+            If True, update internal state (P_relax, counters, certificate)
+            Set to False for visualization agents to avoid corrupting training state
+            
+        Returns:
+        --------
+        actions : np.ndarray
+            Batch of actions, shape (batch_size, action_dim)
+        modes : list[str] (optional)
+            Action sources: 'td3' (certified), 'relax' (uncertified but relaxed), 'fallback' (nominal policy)
+        """
+        states = np.asarray(states)
+        batch_size = len(states)
+        
+        # OPTIMIZATION 1: Batch actor inference (1 call instead of N)
+        actions_actor = self.td3.select_action_batch(states, noise=exploration_noise)
+        
+        # OPTIMIZATION 2: Batch critic inference (1 call instead of N)
+        states_tensor = torch.FloatTensor(states).to(self.device)
+        actions_tensor = torch.FloatTensor(actions_actor).to(self.device)
+        
+        with torch.no_grad():
+            q_values, _ = self.td3.critic(states_tensor, actions_tensor)
+            q_values = q_values.cpu().numpy().flatten()
+        
+        # Vectorized certificate checking
+        certified = np.ones(batch_size, dtype=bool)
+        
+        if self.q_cert is not None:
+            # Condition 1: Lyapunov decrease (q(s,a) - q† >= ν̄)
+            lyapunov_ok = (q_values - self.q_cert) >= self.nu_bar
+            
+            # Condition 2: K_infinity bounds
+            state_norms = np.linalg.norm(states, axis=1)
+            k_low = self.kappa_low(state_norms)
+            k_up = self.kappa_up(state_norms)
+            # κ_low(|s|) <= -q(s,a) <= κ_up(|s|)
+            k_infinity_ok = (k_low <= -q_values) & (-q_values <= k_up)
+            
+            certified = lyapunov_ok & k_infinity_ok
+        
+        # Snapshot P_relax for consistent mode selection (don't modify during loop)
+        current_P_relax = self.P_relax
+        
+        # Vectorized random sampling for relax decisions
+        random_q = np.random.uniform(0, 1, size=batch_size)
+        
+        # Determine modes vectorized
+        modes_array = np.where(certified, 'td3', 
+                               np.where(random_q >= current_P_relax, 'fallback', 'relax'))
+        
+        # Build final actions array
+        final_actions = np.empty_like(actions_actor)
+        
+        # Certified actions - use actor
+        final_actions[certified] = actions_actor[certified]
+        
+        # Relax actions - use actor  
+        relax_mask = (modes_array == 'relax')
+        final_actions[relax_mask] = actions_actor[relax_mask]
+        
+        # Fallback actions - use nominal policy (must loop, but rare)
+        fallback_mask = (modes_array == 'fallback')
+        fallback_indices = np.where(fallback_mask)[0]
+        for i in fallback_indices:
+            final_actions[i] = self.nominal_policy(states[i])
+        
+        # Update internal state only if requested (not for visualization)
+        if update_state:
+            self.total_steps += batch_size
+            self.nominal_interventions += np.sum(fallback_mask)
+            self.relax_events += np.sum(relax_mask)
+            # Update P_relax once for entire batch
+            self.P_relax *= (self.lambda_relax ** batch_size)
+            # Update certificate with first certified action
+            certified_indices = np.where(certified)[0]
+            if len(certified_indices) > 0:
+                idx = certified_indices[0]
+                self.update_certificate(states[idx], actions_actor[idx], q_value=q_values[idx])
+        
+        if return_modes:
+            return final_actions, modes_array.tolist()
+        return final_actions
+
     def train(self, replay_buffer, batch_size=64):
         """Обучить TD3 agent"""
         return self.td3.train(replay_buffer, batch_size)
@@ -219,13 +338,19 @@ class CALFController:
 
     def get_statistics(self):
         """Получить статистику работы CALF"""
+        total = max(1, self.total_steps)
+        intervention_rate = self.nominal_interventions / total
+        relax_rate = self.relax_events / total
+        certification_rate = 1.0 - intervention_rate - relax_rate
+        
         return {
             'total_steps': self.total_steps,
             'nominal_interventions': self.nominal_interventions,
             'relax_events': self.relax_events,
             'P_relax': self.P_relax,
-            'intervention_rate': self.nominal_interventions / max(1, self.total_steps),
-            'relax_rate': self.relax_events / max(1, self.total_steps),
+            'intervention_rate': intervention_rate,
+            'relax_rate': relax_rate,
+            'certification_rate': certification_rate,
             'q_cert_history': self.q_cert_history.copy()
         }
 

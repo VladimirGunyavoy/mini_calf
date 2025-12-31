@@ -14,10 +14,11 @@ class WindowManager:
     
     # Настройки для разных мониторов
     MONITORS = {
-        "main": {"size": (1920, 1080), "position": (0, 0)},
-        "top": {"size": (1920, 1080), "position": (0, -1080)},
-        "left": {"size": (1875, 970), "position": (-1900, 420)},
-        "down": {"size": (3000, 1700), "position": (-500, 1500)}
+        "local": {"size": (2500, 1500), "position": (0, 0)},
+        "main":  {"size": (2700, 1580), "position": (100, 100)},
+        "top":   {"size": (1920, 1080), "position": (0, -1080)},
+        "left":  {"size": (1875, 970),  "position": (-1900, 420)},
+        "down":  {"size": (3000, 1700), "position": (-500, 1500)}
     }
     
     def __init__(self, 
@@ -65,8 +66,9 @@ class WindowManager:
         
         # FPS
         window.fps_counter.enabled = True
-        window.fps_counter.position = (.85, .47)
-        window.fps_counter.color = color.white
+        window.fps_counter.position = (0.85, 0.47)
+        window.fps_counter.color = color.yellow
+        window.fps_counter.scale = 1.5
         
         # Цвет фона из ColorManager (если передан), иначе темный по умолчанию
         if self.color_manager:
@@ -86,6 +88,10 @@ class WindowManager:
         print("  Space - up")
         print("  Shift - down")
         print("  Q - quit")
+        print("  P - pause/resume training")
+        print("  H - toggle heatmap")
+        print("  G - toggle grid overlay")
+        print("  +/- - add/remove agents")
         print("  F - fullscreen")
         print("  M - show/hide cursor")
         print("  Alt - toggle freeze (cursor + camera)")

@@ -36,7 +36,7 @@ SEED = 42
 N_AGENTS_VISUAL = 25  # Number of agents to visualize simultaneously
 TRAIL_MAX_LENGTH = 600
 TRAIL_DECIMATION = 1  # No decimation - capture every point
-TRAIL_REBUILD_FREQ = 5  # Rebuild more frequently for smooth trails
+TRAIL_REBUILD_FREQ = 15  # Rebuild frequency (higher = better performance, less smooth)
 
 # Critic heatmap parameters
 HEATMAP_ENABLED = True
@@ -310,12 +310,12 @@ print()
 def get_agent_height(state):
     """
     Get Y coordinate for agent based on critic Q-value
-    
+
     Parameters:
     -----------
     state : np.ndarray
         State vector [x, v]
-    
+
     Returns:
     --------
     float
@@ -328,6 +328,28 @@ def get_agent_height(state):
     else:
         # Before training starts, use default height
         return 0.1
+
+def get_agent_heights_batch(states):
+    """
+    Get Y coordinates for a batch of agents based on critic Q-values (optimized)
+
+    Parameters:
+    -----------
+    states : np.ndarray
+        Batch of state vectors, shape (batch_size, 2) where each is [x, v]
+
+    Returns:
+    --------
+    np.ndarray
+        Y coordinates, shape (batch_size,)
+    """
+    if critic_heatmap is not None and training_stats['training_started']:
+        # Batch interpolation from cached Q-values grid
+        q_heights = critic_heatmap.get_q_value_for_states_batch(states, use_cached=True)
+        return q_heights + 2 * AGENT_HEIGHT_EPSILON  # Agents at 2*epsilon
+    else:
+        # Before training starts, use default height
+        return np.full(len(states), 0.1)
 
 def update():
     """Main training loop - called every frame"""
@@ -422,15 +444,23 @@ def update():
                 print(f"  Checkpoint saved: {checkpoint_path}")
 
     # Update visual agents (continuous flow - reset immediately when done)
+    # Batch inference for all agents (more efficient than 25 individual calls)
+    if training_stats['training_started']:
+        # Collect all states
+        vis_states = np.array([env.state for env in visual_envs])
+        # Batch inference: 1 forward pass instead of 25
+        vis_actions = td3_agent.select_action_batch(vis_states, noise=0.0)
+    else:
+        # Random actions during exploration
+        vis_actions = np.random.uniform(-env.max_action, env.max_action, size=(len(visual_envs), env.action_dim))
+
+    # Step all environments and collect next states
+    vis_next_states = []
+    vis_done_flags = []
+
     for i in range(len(visual_envs)):
         vis_env = visual_envs[i]
-        vis_state = vis_env.state
-
-        # TD3 action for visual agent
-        if training_stats['training_started']:
-            vis_action = td3_agent.select_action(vis_state, noise=0.0)  # No noise for visualization
-        else:
-            vis_action = np.random.uniform(-env.max_action, env.max_action, size=env.action_dim)
+        vis_action = vis_actions[i]
 
         # Step visual environment
         vis_next_state, vis_reward, vis_done, vis_info = vis_env.step(vis_action)
@@ -444,9 +474,21 @@ def update():
         elif vis_position > BOUNDARY_LIMIT:
             vis_done = True
 
+        vis_next_states.append(vis_next_state)
+        vis_done_flags.append(vis_done)
+
+    # Batch compute heights for all agents (1 call instead of 25-50)
+    vis_next_states_array = np.array(vis_next_states)
+    vis_heights = get_agent_heights_batch(vis_next_states_array)
+
+    # Update positions with batch-computed heights
+    for i in range(len(visual_envs)):
+        vis_next_state = vis_next_states[i]
+        vis_done = vis_done_flags[i]
+
         # Update position (обновляем real_position для зума)
         x, v = vis_next_state[0], vis_next_state[1]
-        y = get_agent_height(vis_next_state)  # Y based on Q-value
+        y = vis_heights[i]  # Y from batch computation
         position = (x, y, v)
         visual_points[i].real_position = np.array(position)
         # Применяем текущую трансформацию (без пересчета всех объектов)
@@ -456,11 +498,11 @@ def update():
         # Continuous flow: reset immediately when done (no batching)
         if vis_done:
             visual_trails[i].clear()
-            vis_env.reset()
+            visual_envs[i].reset()
             # Update position to new starting point (обновляем real_position для зума)
-            new_state = vis_env.state
+            new_state = visual_envs[i].state
             x, v = new_state[0], new_state[1]
-            y = get_agent_height(new_state)  # Y based on Q-value
+            y = get_agent_height(new_state)  # Single call for reset (rare)
             new_position = (x, y, v)
             visual_points[i].real_position = np.array(new_position)
             # Применяем текущую трансформацию
@@ -520,10 +562,22 @@ def update():
     avg_reward = np.mean(training_stats['episode_rewards'][-10:]) if training_stats['episode_rewards'] else 0
     success_rate = training_stats['success_count'] / max(1, training_stats['episode']) * 100
 
-    # Get Q-value range for display
+    # Get Q-value range and performance stats for display
     q_min, q_max = (0, 0)
+    heatmap_perf = None
     if critic_heatmap is not None:
         q_min, q_max = critic_heatmap.get_q_range()
+        heatmap_perf = critic_heatmap.get_performance_stats()
+
+    # Build performance section
+    perf_section = ""
+    if heatmap_perf and heatmap_perf['update_count'] > 0:
+        perf_section = f'''
+=== Heatmap Performance ===
+Updates: {heatmap_perf['update_count']}
+Avg: {heatmap_perf['avg_time_ms']:.2f}ms ({heatmap_perf['avg_fps']:.1f} FPS)
+EMA: {heatmap_perf['ema_time_ms']:.2f}ms ({heatmap_perf['ema_fps']:.1f} FPS)
+'''
 
     stats_text.text = f'''TD3 Training Progress
 
@@ -548,8 +602,7 @@ Actor Loss: {training_stats['avg_actor_loss']:.4f}
 
 === Critic Q-values ===
 Min: {q_min:.2f}
-Max: {q_max:.2f}
-
+Max: {q_max:.2f}{perf_section}
 Press P to pause'''
 
     # Update managers

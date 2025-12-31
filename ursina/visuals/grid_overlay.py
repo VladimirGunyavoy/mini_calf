@@ -139,7 +139,7 @@ class GridOverlay:
             destroy(node)
         for line in self.line_entities:
             destroy(line)
-        
+
         self.node_entities = []
         self.line_entities = []
     
