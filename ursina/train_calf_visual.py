@@ -34,11 +34,15 @@ EVAL_INTERVAL = 10
 SEED = 42
 REWARD_SCALE = 10  # Scale rewards for better learning (env rewards are ~-2 to -0.1)
 
+# Resume training from checkpoint
+RESUME_TRAINING = True  # Set to True to continue training from checkpoint
+RESUME_CHECKPOINT = "trained_calf_final.pth"  # Checkpoint to resume from
+
 # CALF parameters
-LAMBDA_RELAX = 0.999999  # Relaxation factor (меньше значение = быстрее уменьшается P_relax)
+LAMBDA_RELAX = 0.99995  # Relaxation factor (меньше значение = быстрее уменьшается P_relax)
 NU_BAR = 0.01  # Lyapunov decrease threshold
-KAPPA_LOW_COEF = 0.5  # Lower K_∞ coefficient
-KAPPA_UP_COEF = 2.0  # Upper K_∞ coefficient
+KAPPA_LOW_COEF = 0.01  # Lower K_∞ coefficient (уменьшено с 0.5 для расширения диапазона)
+KAPPA_UP_COEF = 1000.0  # Upper K_∞ coefficient (увеличено с 2.0 для расширения диапазона)
 
 # Visualization parameters
 N_AGENTS_VISUAL = 5  # Number of agents to visualize simultaneously
@@ -70,7 +74,7 @@ torch.manual_seed(SEED)
 # ============================================================================
 # SETUP URSINA BEFORE APP
 # ============================================================================
-WindowManager.setup_before_app(monitor="main")
+WindowManager.setup_before_app(monitor="left")
 app = Ursina()
 
 # ============================================================================
@@ -78,7 +82,7 @@ app = Ursina()
 # ============================================================================
 player = Player()
 color_manager = ColorManager()
-window_manager = WindowManager(color_manager=color_manager, monitor="main")
+window_manager = WindowManager(color_manager=color_manager, monitor="left")
 zoom_manager = ZoomManager(player=player)
 object_manager = ObjectManager(zoom_manager=zoom_manager)
 input_manager = InputManager(zoom_manager=zoom_manager, player=player)
@@ -149,6 +153,30 @@ print(f"  Lambda_relax: {LAMBDA_RELAX}")
 print(f"  Nu_bar (Lyapunov threshold): {NU_BAR}")
 print(f"  Kappa coefficients: [{KAPPA_LOW_COEF}, {KAPPA_UP_COEF}]")
 print(f"  Reward scale: {REWARD_SCALE}x (env rewards: ~-2.0 to -0.1)")
+
+# Load checkpoint if resuming
+if RESUME_TRAINING:
+    checkpoint_path = Path(__file__).parent / RESUME_CHECKPOINT
+    if checkpoint_path.exists():
+        calf_agent.load(str(checkpoint_path))
+        print(f"\n{'='*70}")
+        print(f"RESUMING TRAINING FROM CHECKPOINT")
+        print(f"{'='*70}")
+        print(f"Loaded checkpoint: {checkpoint_path}")
+
+        # Reset P_relax to 0 for strict certification
+        calf_agent.P_relax = 0.0
+        print(f"Set P_relax = 0.0 (no relaxation - strict mode)")
+
+        stats = calf_agent.get_statistics()
+        print(f"Loaded statistics:")
+        print(f"  Total steps: {stats['total_steps']}")
+        print(f"  Certification rate: {stats['certification_rate']:.3f}")
+        print(f"  Intervention rate: {stats['intervention_rate']:.3f}")
+        print(f"  Relax rate: {stats['relax_rate']:.3f}")
+    else:
+        print(f"\nWARNING: Checkpoint not found at {checkpoint_path}")
+        print(f"Starting training from scratch...")
 
 # Replay buffer
 replay_buffer = ReplayBuffer(
@@ -227,17 +255,22 @@ class VisualAgent:
         # 2. Применяем трансформацию зума вручную (как в старом коде)
         self.visual_point.apply_transform(a_trans, b_trans)
 
+        # Маппинг режимов: CALF использует 'nominal', визуализация использует 'fallback'
+        display_mode = mode
+        if mode == 'nominal':
+            display_mode = 'fallback'
+
         # Обновляем цвет шарика в зависимости от режима
-        if mode == 'td3':
+        if display_mode == 'td3':
             self.visual_point.color = Vec4(0.2, 0.4, 1.0, 1)  # Blue
-        elif mode == 'relax':
+        elif display_mode == 'relax':
             self.visual_point.color = Vec4(0.2, 0.7, 0.3, 1)  # Green
-        elif mode == 'fallback':
+        elif display_mode == 'fallback':
             self.visual_point.color = Vec4(1.0, 0.5, 0.1, 1)  # Orange
 
         # Добавляем точку в траекторию с ТЕМИ ЖЕ трансформациями
-        # Это гарантирует что шарик и траектория синхронизированы
-        self.trail.add_point(self.real_position, mode=mode,
+        # Используем display_mode для корректного отображения
+        self.trail.add_point(self.real_position, mode=display_mode,
                            a_transform=a_trans, b_translate=b_trans)
 
     def clear_trail(self):
@@ -274,6 +307,29 @@ training_agent_visual = VisualAgent(
 )
 
 print(f"Training agent visualization initialized (orange)")
+
+# ============================================================================
+# Q-CERTIFICATE TIMELINE GRAPH
+# ============================================================================
+
+# Graph for Q† evolution over time (normalized coordinates)
+# Origin at (6, 0, 0), X-axis = simulation time, Y-axis = Q† value
+q_cert_timeline = LineTrail(
+    max_points=TRAIL_MAX_LENGTH,
+    line_thickness=3,
+    decimation=TRAIL_DECIMATION,
+    rebuild_freq=TRAIL_REBUILD_FREQ
+)
+zoom_manager.register_object(q_cert_timeline, 'q_cert_timeline')
+
+# Graph metadata
+q_cert_graph_origin = np.array([3.0, 0.0, 0.0])  # Origin point in world space (ближе к центру)
+q_cert_step_counter = 0  # Step counter for X-axis (time)
+q_cert_max_display_steps = MAX_STEPS_PER_EPISODE  # Max steps to display (for X scaling to [0, 2])
+q_cert_min_value = 0.0  # Track min Q† value for scaling
+q_cert_max_value = -100.0  # Track max Q† value for scaling
+
+print(f"Q-certificate timeline graph initialized at origin {q_cert_graph_origin}")
 
 # ============================================================================
 # CRITIC HEATMAP SETUP
@@ -359,8 +415,8 @@ legend_text = Text(
          '<orange>Orange</orange> = Fallback (nominal policy)\n'
          '\n'
          'AGENTS:\n'
-         '<color:rgb(255,128,0)>Orange point</color> = Training agent (with noise)\n'
-         '<blue>Blue points</blue> = Visual agents (no noise)',
+         '<color:rgb(255,128,0)>Orange point</color> = Training agent (CALF mode switching)\n'
+         '<blue>Blue points</blue> = Visual agents (pure TD3 policy)',
     position=(0.4, 0.45),
     scale=0.7,
     origin=(-0.5, 0.5),
@@ -424,7 +480,7 @@ def get_agent_heights_batch(states):
 
 def update():
     """Main training loop - called every frame"""
-    global current_state, training_stats
+    global current_state, training_stats, q_cert_step_counter, q_cert_min_value, q_cert_max_value
 
     if training_stats['paused']:
         return
@@ -480,13 +536,52 @@ def update():
         train_position = (x, train_agent_height, v)
 
         # Update position (this will automatically update trail with mode color)
-        # Determine mode (not using batch here since it's just one agent)
-        if hasattr(calf_agent, 'last_mode'):
-            mode = calf_agent.last_mode
+        # Determine mode from last action source (CALF uses 'td3', 'relax', 'nominal')
+        if len(calf_agent.action_sources) > 0:
+            mode = calf_agent.action_sources[-1]  # Last action source
         else:
             mode = 'td3'  # Default
 
         training_agent_visual.update_position(train_position, mode=mode)
+
+        # Update Q-certificate timeline graph
+        # X-axis: normalized time (step counter / normalization)
+        # Y-axis: normalized Q† value (q_cert / normalization)
+        q_cert_step_counter += 1
+
+        if calf_agent.q_cert is not None:
+            # Update min/max Q† values for scaling
+            q_cert_min_value = min(q_cert_min_value, calf_agent.q_cert)
+            q_cert_max_value = max(q_cert_max_value, calf_agent.q_cert)
+
+            # Normalize X to [0, 2] based on max episode steps
+            graph_x = 2.0 * (q_cert_step_counter / q_cert_max_display_steps)
+
+            # Normalize Y to [0, 2] based on min/max Q† values
+            if abs(q_cert_max_value - q_cert_min_value) > 0.001:
+                # Scale to [0, 2] range
+                graph_y = 2.0 * (calf_agent.q_cert - q_cert_min_value) / (q_cert_max_value - q_cert_min_value)
+            else:
+                # If all values are same, put at middle
+                graph_y = 1.0
+
+            # Transform to world coordinates: origin + (x_offset, y_offset, 0)
+            # Graph X-axis = simulation X-axis (right)
+            # Graph Y-axis = simulation Y-axis (upward)
+            graph_position = q_cert_graph_origin + np.array([graph_x, graph_y, 0.0])
+
+            # Add point to timeline with current mode color
+            # Get current zoom transformations
+            a_trans = zoom_manager.a_transformation
+            b_trans = zoom_manager.b_translation
+
+            # Map mode for visualization (same as VisualAgent)
+            display_mode = mode
+            if mode == 'nominal':
+                display_mode = 'fallback'
+
+            q_cert_timeline.add_point(graph_position, mode=display_mode,
+                                     a_transform=a_trans, b_translate=b_trans)
 
     # Episode termination
     if done:
@@ -498,6 +593,16 @@ def update():
 
         # Clear training agent trail on episode end
         training_agent_visual.clear_trail()
+
+        # Clear Q-certificate timeline graph on episode end
+        q_cert_timeline.clear()
+        q_cert_step_counter = 0
+        q_cert_min_value = 0.0
+        q_cert_max_value = -100.0
+
+        # Reset CALF certificate for new episode
+        if training_stats['training_started']:
+            calf_agent.reset_certificate()
 
         # Reset for new episode
         current_state = env.reset()
@@ -542,10 +647,11 @@ def update():
         if training_stats['training_started']:
             # Collect all states
             vis_states = np.array([env.state for env in visual_envs])
-            # Batch inference: 1 forward pass instead of 25, with modes (NO state update!)
-            vis_actions, vis_modes = calf_agent.select_action_batch(
-                vis_states, exploration_noise=0.0, return_modes=True, update_state=False
-            )
+            # ВАЖНО: Визуальные агенты используют чистую TD3 политику без CALF сертификации
+            # Это правильно, т.к. они нужны только для демонстрации обученной политики
+            # Только тренировочный агент использует CALF с сертификацией
+            vis_actions = calf_agent.td3.select_action_batch(vis_states, noise=0.0)
+            vis_modes = ['td3'] * len(visual_envs)  # Визуальные агенты всегда TD3 (без сертификации)
         else:
             # Random actions during exploration
             vis_actions = np.random.uniform(-env.max_action, env.max_action, size=(len(visual_envs), env.action_dim))
@@ -657,6 +763,36 @@ def update():
     # Get CALF statistics
     calf_stats = calf_agent.get_statistics()
 
+    # Get current Q-value for display
+    current_q = 0.0
+    q_cert_val = 0.0
+    current_mode = 'exploration'
+    k_low_val = 0.0
+    k_up_val = 0.0
+    neg_q_val = 0.0
+    state_norm = 0.0
+    if training_stats['training_started']:
+        # Get Q-value for current state and last action
+        state_tensor = torch.FloatTensor(current_state.reshape(1, -1)).to(device)
+        action_tensor = torch.FloatTensor(action.reshape(1, -1)).to(device)
+        with torch.no_grad():
+            q_val, _ = calf_agent.td3.critic(state_tensor, action_tensor)
+            current_q = q_val.item()
+
+        # Get certified Q-value
+        if calf_agent.q_cert is not None:
+            q_cert_val = calf_agent.q_cert
+
+        # Get current mode
+        if len(calf_agent.action_sources) > 0:
+            current_mode = calf_agent.action_sources[-1]
+
+        # Get K_infinity bounds
+        state_norm = np.linalg.norm(current_state)
+        k_low_val = calf_agent.kappa_low(state_norm)
+        k_up_val = calf_agent.kappa_up(state_norm)
+        neg_q_val = -current_q
+
     # Build performance section
     perf_section = ""
     if heatmap_perf and heatmap_perf['update_count'] > 0:
@@ -689,14 +825,27 @@ Critic Loss: {training_stats['avg_critic_loss']:.4f}
 Actor Loss: {training_stats['avg_actor_loss']:.4f}
 
 === CALF Statistics ===
+Current Mode: {current_mode.upper()}
 P_relax: {calf_stats['P_relax']:.8f}
 Certification: {calf_stats['certification_rate']:.3f}
 Intervention: {calf_stats['intervention_rate']:.3f}
 Relax: {calf_stats['relax_rate']:.3f}
 
-=== Critic Q-values ===
-Min: {q_min:.2f}
-Max: {q_max:.2f}{perf_section}
+=== Q-values ===
+Q(s,a) current: {current_q:.4f}
+Q_cert (Q†): {q_cert_val:.4f}
+Delta_Q (Q - Q†): {current_q - q_cert_val:.4f}
+Threshold nu_bar: {NU_BAR:.4f}
+
+=== K_infinity Bounds ===
+|s| (state norm): {state_norm:.4f}
+k_low (0.5*|s|^2): {k_low_val:.4f}
+-Q(s,a): {neg_q_val:.4f}
+k_up (2.0*|s|^2): {k_up_val:.4f}
+Valid: {"YES" if k_low_val <= neg_q_val <= k_up_val else "NO"}
+
+Grid Min: {q_min:.2f}
+Grid Max: {q_max:.2f}{perf_section}
 Press P to pause'''
 
     # Update managers
@@ -727,9 +876,6 @@ Press P to pause'''
         calf_agent.save(str(final_path))
         print(f"\nFinal model saved: {final_path}")
 
-        # Close debug log
-        debug_log_file.close()
-        print(f"Debug log closed")
 
         application.quit()
 

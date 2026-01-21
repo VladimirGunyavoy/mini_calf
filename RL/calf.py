@@ -156,13 +156,13 @@ class CALFController:
     def update_certificate(self, state, action, q_value=None):
         """
         Обновить сертифицированную тройку (s†, a†, q†)
-        
+
         Parameters:
         -----------
         state : np.ndarray
             State vector
         action : np.ndarray
-            Action vector  
+            Action vector
         q_value : float, optional
             Pre-computed Q-value (to avoid redundant forward pass in batch mode)
         """
@@ -179,6 +179,14 @@ class CALFController:
         self.a_cert = action.copy()
         self.q_cert = q_value
         self.q_cert_history.append(q_value)
+
+    def reset_certificate(self):
+        """
+        Сбросить сертифицированную тройку (вызывать при начале нового эпизода)
+        """
+        self.s_cert = None
+        self.a_cert = None
+        self.q_cert = None
 
     def select_action(self, state, exploration_noise=0.0):
         """
