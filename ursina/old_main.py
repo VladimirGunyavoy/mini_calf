@@ -1,0 +1,404 @@
+"""
+OLD MAIN - KEPT FOR REFERENCE ONLY
+This file has been replaced by the new modular main.py (Stage 3)
+See: ursina/llm/stage_2/01_OPTIMIZATION_PLAN.md
+
+Original description:
+Основной файл для среды тренировки с Ursina
+Версия с возможностью свободного полёта, полом и frame
+Включает InputManager, ZoomManager и ObjectManager
+"""
+
+import numpy as np
+
+from ursina import *
+from core import Player, setup_scene
+from managers import (
+    InputManager,
+    WindowManager,
+    ZoomManager,
+    ObjectManager,
+    ColorManager,
+    UIManager,
+    GeneralObjectManager
+)
+# Импорт модуля physics (физические системы)
+from physics import PointSystem, SimulationEngine, VectorizedEnvironment
+from physics.policies import PDPolicy, TD3Policy, CALFPolicy, PolicyAdapter, RandomSwitchPolicy
+from visuals import PointVisual, SimpleTrail
+from pathlib import Path
+
+# ВАЖНО: Устанавливаем размер и позицию окна ДО создания приложения Ursina
+WindowManager.setup_before_app(monitor="main")
+
+app = Ursina()
+
+# ============================================================================
+# ИНИЦИАЛИЗАЦИЯ КОМПОНЕНТОВ
+# ============================================================================
+
+# Базовые независимые компоненты
+player = Player()
+color_manager = ColorManager()
+
+# Менеджеры (порядок создания менее критичен)
+window_manager = WindowManager(color_manager=color_manager, monitor="left")
+zoom_manager = ZoomManager(player=player)
+object_manager = ObjectManager(zoom_manager=zoom_manager)
+input_manager = InputManager(zoom_manager=zoom_manager, player=player)
+ui_manager = UIManager(
+    color_manager=color_manager,
+    player=player,
+    zoom_manager=zoom_manager
+)
+
+# Симуляция и связь с визуализацией
+simulation_engine = SimulationEngine()
+general_object_manager = GeneralObjectManager(
+    simulation_engine=simulation_engine,
+    object_manager=object_manager,
+    zoom_manager=zoom_manager
+)
+
+# ============================================================================
+# НАСТРОЙКА СЦЕНЫ - единая функция
+# ============================================================================
+
+ground, grid, lights, frame = setup_scene(color_manager, object_manager)
+
+# ============================================================================
+# ТЕСТОВЫЕ ОБЪЕКТЫ - создаем через ObjectManager
+# ============================================================================
+
+# # Стрелка
+# object_manager.create_object(
+#     name='my_arrow',
+#     model='assets/arrow.obj',
+#     position=(0.5, 0.5, 0.5),
+#     scale=1.0,
+#     color_val=color.red
+# )
+
+# # Кубики на осях
+# k = 0.05
+# object_manager.create_object(
+#     name='my_cube_1',
+#     model='cube',
+#     position=(1, 0, 0),
+#     scale=k * np.array([1, 1, 1]),
+#     color_val=color.blue
+# )
+
+# object_manager.create_object(
+#     name='my_cube_2',
+#     model='cube',
+#     position=(0, 1, 0),
+#     scale=k * np.array([1, 1, 1]),
+#     color_val=color.green
+# )
+
+# object_manager.create_object(
+#     name='my_cube_3',
+#     model='cube',
+#     position=(0, 0, 1),
+#     scale=k * np.array([1, 1, 1]),
+#     color_val=color.yellow
+# )
+
+# Вывести статистику
+object_manager.print_stats()
+
+# ============================================================================
+# ОБЩИЕ ОБЪЕКТЫ - создаем через GeneralObjectManager
+# ============================================================================
+
+# ============================================================================
+# PHASE 9: TD3 vs CALF - Сравнение реального TD3 с CALF
+# ============================================================================
+
+print("\n" + "="*70)
+print("PHASE 9: TD3 vs CALF DUAL VISUALIZATION")
+print("="*70)
+
+# Параметры для dual визуализации
+N_AGENTS_PER_GROUP = 15  # 15 агентов на группу = 30 всего
+SEED = 42
+
+print(f"\nLoading Policies...")
+
+# Путь к обученной модели TD3
+model_path = Path(__file__).parent.parent / "RL" / "calf_model.pth"
+
+# Загрузка TD3 политики (реальный агент)
+try:
+    td3_policy = TD3Policy.create_from_checkpoint(
+        checkpoint_path=str(model_path),
+        state_dim=2,
+        action_dim=1,
+        max_action=5.0
+    )
+    print("[OK] TD3 policy loaded (real agent on CUDA)!")
+except Exception as e:
+    print(f"[WARNING] Failed to load TD3: {e}")
+    print("Using stub mode instead")
+    td3_policy = TD3Policy(agent=None, action_dim=1, action_scale=0.3)
+
+# Создание CALF политики (TD3 + PD fallback)
+pd_policy = PDPolicy(
+    kp=1.0,
+    kd=1.0,
+    target=np.array([0.0]),  # 1D target for control
+    dim=1  # 1D control
+)
+
+try:
+    td3_for_calf = TD3Policy.create_from_checkpoint(
+        checkpoint_path=str(model_path),
+        state_dim=2,
+        action_dim=1,
+        max_action=5.0
+    )
+    calf_policy = CALFPolicy(
+        td3_policy=td3_for_calf,
+        pd_policy=pd_policy,
+        fallback_threshold=0.3,
+        relax_threshold=0.6,
+        target=np.array([0.0, 0.0])  # 2D target for safety metric
+    )
+    print("[OK] CALF policy created!")
+except Exception as e:
+    print(f"[WARNING] Failed to create CALF: {e}")
+    calf_policy = pd_policy
+
+print(f"\nCreating 2 groups of {N_AGENTS_PER_GROUP} agents:")
+print(f"   - LEFT (BLUE):  Real TD3 agent")
+print(f"   - RIGHT (MULTI): CALF (TD3 + PD fallback)")
+print(f"   - Initial conditions: SYNCHRONIZED (same seed)")
+print()
+
+# Конфигурация траекторий (кольцевой буфер)
+trail_config = {
+    'max_length': 150,    # Размер кольцевого буфера (количество точек)
+    'decimation': 3,      # Каждую 3-ю точку добавлять
+    'point_size': 0.03    # Размер точек траектории
+}
+
+# Векторизованные среды с агентами и встроенными траекториями
+vec_env_td3 = VectorizedEnvironment(
+    n_envs=N_AGENTS_PER_GROUP,
+    policy=td3_policy,
+    dt=0.01,
+    seed=SEED,
+    object_manager=object_manager,
+    group_name="td3",
+    offset=(-8, 0, 0),  # LEFT side
+    color=Vec4(0.2, 0.3, 0.8, 1),  # Blue
+    trail_config=trail_config,
+    create_agents=True  # ВКЛЮЧАЕМ создание Agent объектов
+)
+
+vec_env_calf = VectorizedEnvironment(
+    n_envs=N_AGENTS_PER_GROUP,
+    policy=calf_policy,
+    dt=0.01,
+    seed=SEED,
+    object_manager=object_manager,
+    group_name="calf",
+    offset=(8, 0, 0),  # RIGHT side
+    color=Vec4(0.8, 0.4, 0.15, 1),  # Orange (fallback)
+    trail_config=trail_config,
+    create_agents=True  # ВКЛЮЧАЕМ создание Agent объектов
+)
+
+vec_env_td3.reset()
+vec_env_calf.reset()
+
+print(f"[OK] VectorizedEnvironments created with {N_AGENTS_PER_GROUP} agents each")
+print(f"[OK] Each agent owns its trajectory (ring buffer with {trail_config['max_length']} points)")
+
+# Статистика для отслеживания
+stats = {
+    'td3_success': 0,
+    'calf_success': 0,
+    'td3_resets': 0,
+    'calf_resets': 0,
+    'td3_distances': [],
+    'calf_distances': [],
+    'td3_steps_to_goal': [],
+    'calf_steps_to_goal': [],
+    'step_counter': 0
+}
+
+# Агенты уже созданы внутри VectorizedEnvironment!
+# Каждый агент владеет своей траекторией (кольцевой буфер)
+print(f"[OK] TD3 group (BLUE, LEFT): {len(vec_env_td3.agents)} agents with trails")
+print(f"[OK] CALF group (MULTI-COLOR, RIGHT): {len(vec_env_calf.agents)} agents with trails")
+
+# Желтые сферы в центрах симуляций (цели)
+# TD3 goal (LEFT): x=-8, z=0
+object_manager.create_object(
+    name='td3_goal',
+    model='sphere',
+    position=(-8, 0, 0),
+    scale=0.25,
+    color_val=Vec4(0.8, 0.8, 0.3, 0.3)
+)
+
+# CALF goal (RIGHT): x=+8, z=0
+object_manager.create_object(
+    name='calf_goal',
+    model='sphere',
+    position=(8, 0, 0),
+    scale=0.25,
+    color_val=Vec4(0.8, 0.8, 0.3, 0.3)
+)
+
+# Boundary boxes
+# TD3 box (left)
+object_manager.create_object(
+    name='td3_boundary',
+    model='cube',
+    position=(-8, 0, 0),
+    scale=(10, 0.1, 10),
+    color_val=Vec4(0.2, 0.3, 0.8, 0.1)
+)
+
+# CALF box (right)
+object_manager.create_object(
+    name='calf_boundary',
+    model='cube',
+    position=(8, 0, 0),
+    scale=(10, 0.1, 10),
+    color_val=Vec4(0.2, 0.6, 0.3, 0.1)
+)
+
+# UI текст для статистики
+stats_text = Text(
+    text='',
+    position=(-0.85, 0.45),
+    scale=1.0,
+    color=color.white
+)
+
+# Метки для групп
+Text(
+    text='TD3',
+    position=(-0.5, -0.4),
+    scale=2,
+    color=Vec4(0.2, 0.3, 0.8, 1)
+)
+Text(
+    text='CALF',
+    position=(0.35, -0.4),
+    scale=2,
+    color=Vec4(0.2, 0.6, 0.3, 1)
+)
+
+print()
+print("="*70)
+print("[OK] DUAL VISUALIZATION READY")
+print("="*70)
+print()
+
+general_object_manager.print_stats()
+simulation_engine.print_stats()
+
+def update():
+    """Обновление каждого кадра - вызывается автоматически Ursina"""
+    global stats
+
+    # 1. Обновление математики (симуляция физики)
+    simulation_engine.update_all()
+
+    # 2. Синхронизация визуализации с математикой
+    general_object_manager.update_all()
+
+    # 3. TD3 vs CALF: Update vectorized environments
+    # VectorizedEnvironment.step() автоматически обновляет агентов и их траектории!
+    vec_env_td3.step()
+    vec_env_calf.step()
+    stats['step_counter'] += 1
+
+    # Update TD3 group - только статистика и сброс (визуализация обновляется автоматически)
+    for i in range(vec_env_td3.n_envs):
+        state = vec_env_td3.envs[i].state
+        distance = np.linalg.norm(state)
+        stats['td3_distances'].append(distance)
+
+        # Reset on success
+        if distance < 0.15:
+            stats['td3_success'] += 1
+            stats['td3_steps_to_goal'].append(stats['step_counter'])
+            stats['td3_resets'] += 1
+            # Используем новый метод reset_agent (автоматически очищает траекторию)
+            vec_env_td3.reset_agent(i)
+
+    # Update CALF group - только статистика и сброс (визуализация обновляется автоматически)
+    for i in range(vec_env_calf.n_envs):
+        state = vec_env_calf.envs[i].state
+        distance = np.linalg.norm(state)
+        stats['calf_distances'].append(distance)
+
+        # Reset on success
+        if distance < 0.15:
+            stats['calf_success'] += 1
+            stats['calf_steps_to_goal'].append(stats['step_counter'])
+            stats['calf_resets'] += 1
+            # Используем новый метод reset_agent (автоматически очищает траекторию)
+            vec_env_calf.reset_agent(i)
+
+    # Update statistics display
+    td3_avg_dist = np.mean(stats['td3_distances'][-100:]) if stats['td3_distances'] else 0
+    calf_avg_dist = np.mean(stats['calf_distances'][-100:]) if stats['calf_distances'] else 0
+
+    td3_success_rate = stats['td3_success'] / max(1, stats['td3_resets']) * 100
+    calf_success_rate = stats['calf_success'] / max(1, stats['calf_resets']) * 100
+
+    td3_avg_steps = np.mean(stats['td3_steps_to_goal']) if stats['td3_steps_to_goal'] else 0
+    calf_avg_steps = np.mean(stats['calf_steps_to_goal']) if stats['calf_steps_to_goal'] else 0
+
+    better_policy = ""
+    if calf_success_rate > td3_success_rate + 5:
+        better_policy = "CALF BETTER"
+    elif td3_success_rate > calf_success_rate + 5:
+        better_policy = "TD3 BETTER"
+    else:
+        better_policy = "TIED"
+
+    stats_text.text = f'''TD3 vs CALF Comparison
+
+Step: {stats['step_counter']}
+
+=== TD3 (LEFT, BLUE) ===
+Success: {stats['td3_success']}/{stats['td3_resets']} ({td3_success_rate:.1f}%)
+Avg Distance: {td3_avg_dist:.4f}
+Avg Steps to Goal: {td3_avg_steps:.0f}
+
+=== CALF (RIGHT, MULTI-COLOR) ===
+Success: {stats['calf_success']}/{stats['calf_resets']} ({calf_success_rate:.1f}%)
+Avg Distance: {calf_avg_dist:.4f}
+Avg Steps to Goal: {calf_avg_steps:.0f}
+
+>>> {better_policy} <<<'''
+
+    # 4. Обновление менеджеров напрямую
+    # Порядок важен: input → zoom → object → ui
+    if hasattr(input_manager, 'update'):
+        input_manager.update()
+
+    if hasattr(zoom_manager, 'update'):
+        zoom_manager.update()
+
+    if hasattr(object_manager, 'update'):
+        object_manager.update()
+
+    ui_manager.update()
+
+def input(key):
+    """Глобальный обработчик ввода"""
+    # Передаем управление в централизованный InputManager
+    # InputManager сам обрабатывает все клавиши, включая q/escape и alt
+    input_manager.handle_input(key)
+        
+        
+app.run()

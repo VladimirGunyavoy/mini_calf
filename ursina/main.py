@@ -1,399 +1,378 @@
 """
-Основной файл для среды тренировки с Ursina
-Версия с возможностью свободного полёта, полом и frame
-Включает InputManager, ZoomManager и ObjectManager
+CALF Training - Clean Architecture (Stage 3)
+Main entry point with modular component separation
 """
 
-import numpy as np
-
-from ursina import *
-from core import Player, setup_scene
-from managers import (
-    InputManager,
-    WindowManager,
-    ZoomManager,
-    ObjectManager,
-    ColorManager,
-    UIManager,
-    GeneralObjectManager
-)
-# Импорт модуля physics (физические системы)
-from physics import PointSystem, SimulationEngine, VectorizedEnvironment
-from physics.policies import PDPolicy, TD3Policy, CALFPolicy, PolicyAdapter, RandomSwitchPolicy
-from visuals import PointVisual, SimpleTrail
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# ВАЖНО: Устанавливаем размер и позицию окна ДО создания приложения Ursina
-WindowManager.setup_before_app(monitor="main")
+import numpy as np
+import torch
 
-app = Ursina()
+# Import configuration
+from config import AppConfig
 
-# ============================================================================
-# ИНИЦИАЛИЗАЦИЯ КОМПОНЕНТОВ
-# ============================================================================
+# Import core components
+from core import CALFApplication
 
-# Базовые независимые компоненты
-player = Player()
-color_manager = ColorManager()
+# Import training components
+from training import CALFTrainer, TrainingVisualizer
 
-# Менеджеры (порядок создания менее критичен)
-window_manager = WindowManager(color_manager=color_manager, monitor="left")
-zoom_manager = ZoomManager(player=player)
-object_manager = ObjectManager(zoom_manager=zoom_manager)
-input_manager = InputManager(zoom_manager=zoom_manager, player=player)
-ui_manager = UIManager(
-    color_manager=color_manager,
-    player=player,
-    zoom_manager=zoom_manager
-)
+# Import RL components
+from RL.calf import CALFController
+from RL.td3 import ReplayBuffer
+from RL.simple_env import PointMassEnv, pd_nominal_policy
 
-# Симуляция и связь с визуализацией
-simulation_engine = SimulationEngine()
-general_object_manager = GeneralObjectManager(
-    simulation_engine=simulation_engine,
-    object_manager=object_manager,
-    zoom_manager=zoom_manager
-)
+# Import visuals
+from visuals import LineTrail, CriticHeatmap, GridOverlay
+
+# Import profiler
+from utils import PerformanceProfiler
 
 # ============================================================================
-# НАСТРОЙКА СЦЕНЫ - единая функция
+# CONFIGURATION
 # ============================================================================
 
-ground, grid, lights, frame = setup_scene(color_manager, object_manager)
+# Load configuration (can easily switch presets here)
+config = AppConfig.from_preset('medium')
 
-# ============================================================================
-# ТЕСТОВЫЕ ОБЪЕКТЫ - создаем через ObjectManager
-# ============================================================================
+# Override specific parameters if needed
+# config.training.num_episodes = 1000
+# config.visualization.n_agents = 10
 
-# # Стрелка
-# object_manager.create_object(
-#     name='my_arrow',
-#     model='assets/arrow.obj',
-#     position=(0.5, 0.5, 0.5),
-#     scale=1.0,
-#     color_val=color.red
-# )
+# Resume training from checkpoint
+RESUME_TRAINING = True
+RESUME_CHECKPOINT = "trained_calf_final.pth"
 
-# # Кубики на осях
-# k = 0.05
-# object_manager.create_object(
-#     name='my_cube_1',
-#     model='cube',
-#     position=(1, 0, 0),
-#     scale=k * np.array([1, 1, 1]),
-#     color_val=color.blue
-# )
-
-# object_manager.create_object(
-#     name='my_cube_2',
-#     model='cube',
-#     position=(0, 1, 0),
-#     scale=k * np.array([1, 1, 1]),
-#     color_val=color.green
-# )
-
-# object_manager.create_object(
-#     name='my_cube_3',
-#     model='cube',
-#     position=(0, 0, 1),
-#     scale=k * np.array([1, 1, 1]),
-#     color_val=color.yellow
-# )
-
-# Вывести статистику
-object_manager.print_stats()
-
-# ============================================================================
-# ОБЩИЕ ОБЪЕКТЫ - создаем через GeneralObjectManager
-# ============================================================================
-
-# ============================================================================
-# PHASE 9: TD3 vs CALF - Сравнение реального TD3 с CALF
-# ============================================================================
-
-print("\n" + "="*70)
-print("PHASE 9: TD3 vs CALF DUAL VISUALIZATION")
-print("="*70)
-
-# Параметры для dual визуализации
-N_AGENTS_PER_GROUP = 15  # 15 агентов на группу = 30 всего
+# Set random seeds
 SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
-print(f"\nLoading Policies...")
+# Create profiler
+profiler = PerformanceProfiler(ema_alpha=0.1)
+print("\nPerformance profiler enabled")
 
-# Путь к обученной модели TD3
-model_path = Path(__file__).parent.parent / "RL" / "calf_model.pth"
+# Frame counter for profiler updates
+frame_counter = 0
 
-# Загрузка TD3 политики (реальный агент)
-try:
-    td3_policy = TD3Policy.create_from_checkpoint(
-        checkpoint_path=str(model_path),
-        state_dim=2,
-        action_dim=1,
-        max_action=5.0
+# ============================================================================
+# APPLICATION SETUP
+# ============================================================================
+
+# Create and setup application
+app = CALFApplication(config).setup()
+
+# Create training environment
+env = app.create_training_env()
+
+# Create nominal safe policy (PD controller)
+nominal_policy = pd_nominal_policy(max_action=env.max_action, kp=2.0, kd=0.4)
+print(f"\nNominal Policy: PD Controller (kp=2.0, kd=0.4)")
+
+# ============================================================================
+# CALF AGENT SETUP
+# ============================================================================
+
+# Create CALF controller
+calf_agent = CALFController(
+    state_dim=env.state_dim,
+    action_dim=env.action_dim,
+    max_action=env.max_action,
+    nominal_policy=nominal_policy,
+    goal_region_radius=env.goal_radius,
+    nu_bar=config.training.nu_bar,
+    kappa_low_coef=config.training.kappa_low_coef,
+    kappa_up_coef=config.training.kappa_up_coef,
+    lambda_relax=config.training.lambda_relax,
+    hidden_dim=64,
+    lr=3e-4,
+    device=app.device,
+    discount=0.99,
+    tau=0.005,
+    policy_noise=0.2,
+    noise_clip=0.5,
+    policy_freq=2
+)
+
+print(f"\nCALF Parameters:")
+print(f"  Lambda_relax: {config.training.lambda_relax}")
+print(f"  Nu_bar (Lyapunov threshold): {config.training.nu_bar}")
+print(f"  Kappa coefficients: [{config.training.kappa_low_coef}, {config.training.kappa_up_coef}]")
+print(f"  Reward scale: {config.training.reward_scale}x")
+
+# Load checkpoint if resuming
+if RESUME_TRAINING:
+    checkpoint_path = Path(__file__).parent / RESUME_CHECKPOINT
+    if checkpoint_path.exists():
+        calf_agent.load(str(checkpoint_path))
+        print(f"\n{'='*70}")
+        print(f"RESUMING TRAINING FROM CHECKPOINT")
+        print(f"{'='*70}")
+        print(f"Loaded checkpoint: {checkpoint_path}")
+
+        # Reset P_relax to 0 for strict certification
+        calf_agent.P_relax = 0.0
+        print(f"Set P_relax = 0.0 (no relaxation - strict mode)")
+
+        stats = calf_agent.get_statistics()
+        print(f"Loaded statistics:")
+        print(f"  Total steps: {stats['total_steps']}")
+        print(f"  Certification rate: {stats['certification_rate']:.3f}")
+        print(f"  Intervention rate: {stats['intervention_rate']:.3f}")
+        print(f"  Relax rate: {stats['relax_rate']:.3f}")
+    else:
+        print(f"\nWARNING: Checkpoint not found at {checkpoint_path}")
+        print(f"Starting training from scratch...")
+
+# Replay buffer
+replay_buffer = ReplayBuffer(
+    state_dim=env.state_dim,
+    action_dim=env.action_dim,
+    max_size=100000
+)
+
+# ============================================================================
+# TRAINER SETUP
+# ============================================================================
+
+trainer = CALFTrainer(
+    calf_agent=calf_agent,
+    env=env,
+    replay_buffer=replay_buffer,
+    nominal_policy=nominal_policy,
+    config=config.training
+)
+
+# ============================================================================
+# VISUALIZER SETUP
+# ============================================================================
+
+visualizer = TrainingVisualizer(
+    object_manager=app.object_manager,
+    zoom_manager=app.zoom_manager,
+    config=config.visualization,
+    device=app.device
+)
+
+# Setup visual agents
+visual_envs = app.create_visual_envs(config.visualization.n_agents)
+visualizer.setup_visual_agents(visual_envs)
+
+# Setup training agent visualization
+visualizer.setup_training_agent()
+
+# Setup Q-certificate timeline
+q_cert_timeline = LineTrail(
+    max_points=config.visualization.trail_max_length,
+    line_thickness=3,
+    decimation=config.visualization.trail_decimation,
+    rebuild_freq=config.visualization.trail_rebuild_freq
+)
+app.zoom_manager.register_object(q_cert_timeline, 'q_cert_timeline')
+
+q_cert_graph_origin = np.array([3.0, 0.0, 0.0])
+q_cert_max_display_steps = config.training.max_steps_per_episode
+
+visualizer.setup_q_cert_timeline(
+    q_cert_timeline=q_cert_timeline,
+    graph_origin=q_cert_graph_origin,
+    max_display_steps=q_cert_max_display_steps
+)
+
+print(f"Q-certificate timeline graph initialized at origin {q_cert_graph_origin}")
+
+# Setup critic heatmap
+critic_heatmap = None
+grid_overlay = None
+
+if config.visualization.heatmap_enabled:
+    critic_heatmap = CriticHeatmap(
+        td3_agent=calf_agent.td3,
+        grid_size=config.visualization.heatmap_grid_size,
+        x_range=(-config.training.boundary_limit, config.training.boundary_limit),
+        v_range=(-config.training.boundary_limit, config.training.boundary_limit),
+        height_scale=config.visualization.heatmap_height_scale,
+        update_frequency=config.visualization.heatmap_update_freq,
+        surface_epsilon=config.visualization.agent_height_epsilon
     )
-    print("[OK] TD3 policy loaded (real agent on CUDA)!")
-except Exception as e:
-    print(f"[WARNING] Failed to load TD3: {e}")
-    print("Using stub mode instead")
-    td3_policy = TD3Policy(agent=None, action_dim=1, action_scale=0.3)
+    app.zoom_manager.register_object(critic_heatmap, 'critic_heatmap')
 
-# Создание CALF политики (TD3 + PD fallback)
-pd_policy = PDPolicy(
-    kp=1.0,
-    kd=1.0,
-    target=np.array([0.0]),  # 1D target for control
-    dim=1  # 1D control
+    if config.visualization.grid_enabled:
+        grid_overlay = GridOverlay(
+            critic_heatmap=critic_heatmap,
+            node_size=config.visualization.grid_node_size,
+            line_thickness=config.visualization.grid_line_thickness,
+            sample_step=config.visualization.grid_sample_step
+        )
+        app.zoom_manager.register_object(grid_overlay, 'grid_overlay')
+
+    visualizer.setup_heatmap(critic_heatmap, grid_overlay)
+
+    print(f"\nCritic Heatmap initialized:")
+    print(f"  Grid size: {config.visualization.heatmap_grid_size}x{config.visualization.heatmap_grid_size}")
+    print(f"  Update frequency: every {config.visualization.heatmap_update_freq} steps")
+
+# Setup UI
+visualizer.setup_ui(config.training)
+
+# Setup profiler UI (bottom-right corner)
+from ursina import Text
+profiler_text = Text(
+    text='Profiler initializing...',
+    position=(0.6, -0.35),
+    origin=(0, 0),
+    scale=0.6,
+    background=True,
+    use_tags=False  # Disable tag parsing to avoid color tag conflicts
 )
 
-try:
-    td3_for_calf = TD3Policy.create_from_checkpoint(
-        checkpoint_path=str(model_path),
-        state_dim=2,
-        action_dim=1,
-        max_action=5.0
-    )
-    calf_policy = CALFPolicy(
-        td3_policy=td3_for_calf,
-        pd_policy=pd_policy,
-        fallback_threshold=0.3,
-        relax_threshold=0.6,
-        target=np.array([0.0, 0.0])  # 2D target for safety metric
-    )
-    print("[OK] CALF policy created!")
-except Exception as e:
-    print(f"[WARNING] Failed to create CALF: {e}")
-    calf_policy = pd_policy
-
-print(f"\nCreating 2 groups of {N_AGENTS_PER_GROUP} agents:")
-print(f"   - LEFT (BLUE):  Real TD3 agent")
-print(f"   - RIGHT (MULTI): CALF (TD3 + PD fallback)")
-print(f"   - Initial conditions: SYNCHRONIZED (same seed)")
-print()
-
-# Конфигурация траекторий (кольцевой буфер)
-trail_config = {
-    'max_length': 150,    # Размер кольцевого буфера (количество точек)
-    'decimation': 3,      # Каждую 3-ю точку добавлять
-    'point_size': 0.03    # Размер точек траектории
-}
-
-# Векторизованные среды с агентами и встроенными траекториями
-vec_env_td3 = VectorizedEnvironment(
-    n_envs=N_AGENTS_PER_GROUP,
-    policy=td3_policy,
-    dt=0.01,
-    seed=SEED,
-    object_manager=object_manager,
-    group_name="td3",
-    offset=(-8, 0, 0),  # LEFT side
-    color=Vec4(0.2, 0.3, 0.8, 1),  # Blue
-    trail_config=trail_config,
-    create_agents=True  # ВКЛЮЧАЕМ создание Agent объектов
-)
-
-vec_env_calf = VectorizedEnvironment(
-    n_envs=N_AGENTS_PER_GROUP,
-    policy=calf_policy,
-    dt=0.01,
-    seed=SEED,
-    object_manager=object_manager,
-    group_name="calf",
-    offset=(8, 0, 0),  # RIGHT side
-    color=Vec4(0.8, 0.4, 0.15, 1),  # Orange (fallback)
-    trail_config=trail_config,
-    create_agents=True  # ВКЛЮЧАЕМ создание Agent объектов
-)
-
-vec_env_td3.reset()
-vec_env_calf.reset()
-
-print(f"[OK] VectorizedEnvironments created with {N_AGENTS_PER_GROUP} agents each")
-print(f"[OK] Each agent owns its trajectory (ring buffer with {trail_config['max_length']} points)")
-
-# Статистика для отслеживания
-stats = {
-    'td3_success': 0,
-    'calf_success': 0,
-    'td3_resets': 0,
-    'calf_resets': 0,
-    'td3_distances': [],
-    'calf_distances': [],
-    'td3_steps_to_goal': [],
-    'calf_steps_to_goal': [],
-    'step_counter': 0
-}
-
-# Агенты уже созданы внутри VectorizedEnvironment!
-# Каждый агент владеет своей траекторией (кольцевой буфер)
-print(f"[OK] TD3 group (BLUE, LEFT): {len(vec_env_td3.agents)} agents with trails")
-print(f"[OK] CALF group (MULTI-COLOR, RIGHT): {len(vec_env_calf.agents)} agents with trails")
-
-# Желтые сферы в центрах симуляций (цели)
-# TD3 goal (LEFT): x=-8, z=0
-object_manager.create_object(
-    name='td3_goal',
-    model='sphere',
-    position=(-8, 0, 0),
-    scale=0.25,
-    color_val=Vec4(0.8, 0.8, 0.3, 0.3)
-)
-
-# CALF goal (RIGHT): x=+8, z=0
-object_manager.create_object(
-    name='calf_goal',
-    model='sphere',
-    position=(8, 0, 0),
-    scale=0.25,
-    color_val=Vec4(0.8, 0.8, 0.3, 0.3)
-)
-
-# Boundary boxes
-# TD3 box (left)
-object_manager.create_object(
-    name='td3_boundary',
-    model='cube',
-    position=(-8, 0, 0),
-    scale=(10, 0.1, 10),
-    color_val=Vec4(0.2, 0.3, 0.8, 0.1)
-)
-
-# CALF box (right)
-object_manager.create_object(
-    name='calf_boundary',
-    model='cube',
-    position=(8, 0, 0),
-    scale=(10, 0.1, 10),
-    color_val=Vec4(0.2, 0.6, 0.3, 0.1)
-)
-
-# UI текст для статистики
-stats_text = Text(
-    text='',
-    position=(-0.85, 0.45),
-    scale=1.0,
-    color=color.white
-)
-
-# Метки для групп
-Text(
-    text='TD3',
-    position=(-0.5, -0.4),
-    scale=2,
-    color=Vec4(0.2, 0.3, 0.8, 1)
-)
-Text(
-    text='CALF',
-    position=(0.35, -0.4),
-    scale=2,
-    color=Vec4(0.2, 0.6, 0.3, 1)
-)
-
-print()
+# Print controls
+print("\n" + "="*70)
+print("CONTROLS")
 print("="*70)
-print("[OK] DUAL VISUALIZATION READY")
-print("="*70)
+print(f"  P - Pause/Resume training")
+print(f"  Q - Quit")
+print(f"  WASD - Move camera")
+print(f"  Scroll - Zoom")
+print(f"  + / = - Add 1 visual agent")
+print(f"  - / _ - Remove 1 visual agent")
+print(f"  H - Toggle heatmap visibility")
+print(f"  G - Toggle grid visibility")
+print(f"  F1 - Export profiler data to CSV")
+print(f"  F2 - Toggle profiler on/off")
+print(f"  F3 - Reset profiler statistics")
 print()
 
-general_object_manager.print_stats()
-simulation_engine.print_stats()
+# ============================================================================
+# MAIN LOOP
+# ============================================================================
 
 def update():
-    """Обновление каждого кадра - вызывается автоматически Ursina"""
-    global stats
+    """Main training loop - called every frame"""
+    global frame_counter
 
-    # 1. Обновление математики (симуляция физики)
-    simulation_engine.update_all()
+    with profiler.measure('total_frame'):
+        if trainer.paused:
+            return
 
-    # 2. Синхронизация визуализации с математикой
-    general_object_manager.update_all()
+        # Training step
+        with profiler.measure('training_step'):
+            next_state, done, info = trainer.train_step()
 
-    # 3. TD3 vs CALF: Update vectorized environments
-    # VectorizedEnvironment.step() автоматически обновляет агентов и их траектории!
-    vec_env_td3.step()
-    vec_env_calf.step()
-    stats['step_counter'] += 1
+        # Update training agent visualization
+        if trainer.training_started:
+            with profiler.measure('training_agent_viz'):
+                visualizer.update_training_agent(next_state, calf_agent)
+                visualizer.update_q_cert_timeline(calf_agent)
 
-    # Update TD3 group - только статистика и сброс (визуализация обновляется автоматически)
-    for i in range(vec_env_td3.n_envs):
-        state = vec_env_td3.envs[i].state
-        distance = np.linalg.norm(state)
-        stats['td3_distances'].append(distance)
+        # Episode termination
+        if done:
+            with profiler.measure('episode_end'):
+                # Handle episode end
+                new_state = trainer.handle_episode_end(info)
 
-        # Reset on success
-        if distance < 0.15:
-            stats['td3_success'] += 1
-            stats['td3_steps_to_goal'].append(stats['step_counter'])
-            stats['td3_resets'] += 1
-            # Используем новый метод reset_agent (автоматически очищает траекторию)
-            vec_env_td3.reset_agent(i)
+                # Clear visualizations
+                visualizer.clear_training_agent_trail()
+                visualizer.clear_q_cert_timeline()
 
-    # Update CALF group - только статистика и сброс (визуализация обновляется автоматически)
-    for i in range(vec_env_calf.n_envs):
-        state = vec_env_calf.envs[i].state
-        distance = np.linalg.norm(state)
-        stats['calf_distances'].append(distance)
+                # Update training agent to new starting position
+                if trainer.training_started:
+                    visualizer.update_training_agent(new_state, calf_agent)
 
-        # Reset on success
-        if distance < 0.15:
-            stats['calf_success'] += 1
-            stats['calf_steps_to_goal'].append(stats['step_counter'])
-            stats['calf_resets'] += 1
-            # Используем новый метод reset_agent (автоматически очищает траекторию)
-            vec_env_calf.reset_agent(i)
+        # Update visual agents (batch processing)
+        with profiler.measure('visual_agents'):
+            visualizer.update_visual_agents(
+                policy=calf_agent.td3,
+                training_started=trainer.training_started,
+                max_steps_per_episode=config.training.max_steps_per_episode,
+                goal_epsilon=config.training.goal_epsilon,
+                boundary_limit=config.training.boundary_limit
+            )
 
-    # Update statistics display
-    td3_avg_dist = np.mean(stats['td3_distances'][-100:]) if stats['td3_distances'] else 0
-    calf_avg_dist = np.mean(stats['calf_distances'][-100:]) if stats['calf_distances'] else 0
+        # Update critic heatmap
+        if trainer.training_started:
+            with profiler.measure('heatmap'):
+                visualizer.update_heatmap(trainer.total_steps)
 
-    td3_success_rate = stats['td3_success'] / max(1, stats['td3_resets']) * 100
-    calf_success_rate = stats['calf_success'] / max(1, stats['calf_resets']) * 100
+        # Update statistics display
+        with profiler.measure('stats_display'):
+            visualizer.update_stats_display(
+                trainer=trainer,
+                calf_agent=calf_agent,
+                current_state=trainer.current_state,
+                action=np.zeros(env.action_dim),  # Last action not stored separately
+                config=config.training
+            )
 
-    td3_avg_steps = np.mean(stats['td3_steps_to_goal']) if stats['td3_steps_to_goal'] else 0
-    calf_avg_steps = np.mean(stats['calf_steps_to_goal']) if stats['calf_steps_to_goal'] else 0
+        # Update managers
+        with profiler.measure('managers'):
+            app.update_managers()
 
-    better_policy = ""
-    if calf_success_rate > td3_success_rate + 5:
-        better_policy = "CALF BETTER"
-    elif td3_success_rate > calf_success_rate + 5:
-        better_policy = "TD3 BETTER"
-    else:
-        better_policy = "TIED"
+        # Update profiler display every 60 frames (~1 second at 60 FPS)
+        frame_counter += 1
+        if frame_counter % 60 == 0:
+            with profiler.measure('profiler_update'):
+                profiler_text.text = profiler.get_report(top_n=5, sort_by='ema')
 
-    stats_text.text = f'''TD3 vs CALF Comparison
+        # Check if training is complete
+        if trainer.is_complete():
+            trainer.finalize()
+            app.quit()
 
-Step: {stats['step_counter']}
-
-=== TD3 (LEFT, BLUE) ===
-Success: {stats['td3_success']}/{stats['td3_resets']} ({td3_success_rate:.1f}%)
-Avg Distance: {td3_avg_dist:.4f}
-Avg Steps to Goal: {td3_avg_steps:.0f}
-
-=== CALF (RIGHT, MULTI-COLOR) ===
-Success: {stats['calf_success']}/{stats['calf_resets']} ({calf_success_rate:.1f}%)
-Avg Distance: {calf_avg_dist:.4f}
-Avg Steps to Goal: {calf_avg_steps:.0f}
-
->>> {better_policy} <<<'''
-
-    # 4. Обновление менеджеров напрямую
-    # Порядок важен: input → zoom → object → ui
-    if hasattr(input_manager, 'update'):
-        input_manager.update()
-
-    if hasattr(zoom_manager, 'update'):
-        zoom_manager.update()
-
-    if hasattr(object_manager, 'update'):
-        object_manager.update()
-
-    ui_manager.update()
+# ============================================================================
+# INPUT HANDLER
+# ============================================================================
 
 def input(key):
-    """Глобальный обработчик ввода"""
-    # Передаем управление в централизованный InputManager
-    # InputManager сам обрабатывает все клавиши, включая q/escape и alt
-    input_manager.handle_input(key)
-        
-        
+    """Handle input"""
+    # First, delegate to input_manager for base functionality (zoom, camera, etc.)
+    app.input_manager.handle_input(key)
+
+    # Then handle training-specific keys
+    if key == 'p':
+        trainer.paused = not trainer.paused
+        print(f"\nTraining {'PAUSED' if trainer.paused else 'RESUMED'}")
+
+    elif key == 'h':
+        visualizer.toggle_heatmap_visibility()
+
+    elif key == 'g':
+        visualizer.toggle_grid_visibility()
+
+    elif key in ['+', '=']:
+        visualizer.add_visual_agent()
+
+    elif key in ['-', '_']:
+        visualizer.remove_visual_agent()
+
+    elif key == 'f1':
+        # Export profiler data to CSV
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"profiler_export_{timestamp}.csv"
+        profiler.export_to_csv(filename)
+        print(f"\nProfiler data exported to: {filename}")
+
+    elif key == 'f2':
+        # Toggle profiler on/off
+        if profiler._enabled:
+            profiler.disable()
+            profiler_text.text = "Profiler: DISABLED"
+            print("\nProfiler disabled")
+        else:
+            profiler.enable()
+            print("\nProfiler enabled")
+
+    elif key == 'f3':
+        # Reset profiler statistics
+        profiler.reset()
+        profiler_text.text = "Profiler: RESET"
+        print("\nProfiler statistics reset")
+
+# ============================================================================
+# START APPLICATION
+# ============================================================================
+
 app.run()

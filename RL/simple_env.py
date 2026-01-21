@@ -1,9 +1,18 @@
+"""
+RL среда для точки с массой (Point Mass).
+
+State: [position, velocity]
+Action: acceleration (scalar)
+Dynamics: x_dot = [velocity, acceleration]
+"""
+
 import numpy as np
+from .base_env import BaseEnv
 
 
-class PointMassEnv:
+class PointMassEnv(BaseEnv):
     """
-    Простая среда: точка в 2D пространстве [позиция, скорость]
+    Простая среда: точка в 2D фазовом пространстве [позиция, скорость]
     Цель: стабилизация в нуле
 
     State: [position, velocity]
@@ -23,16 +32,17 @@ class PointMassEnv:
         goal_radius : float
             Радиус целевой области
         """
-        self.dt = dt
-        self.max_action = max_action
-        self.goal_radius = goal_radius
+        super().__init__(dt, max_action, goal_radius)
 
-        self.state_dim = 2
-        self.action_dim = 1
+    @property
+    def state_dim(self) -> int:
+        """Размерность состояния: [position, velocity]"""
+        return 2
 
-        self.state = None
-        self.steps = 0
-        self.max_steps = 5000
+    @property
+    def action_dim(self) -> int:
+        """Размерность действия: acceleration"""
+        return 1
 
     def reset(self, state=None):
         """Сбросить среду в начальное состояние"""
@@ -48,15 +58,10 @@ class PointMassEnv:
         """Динамика системы: x_dot = [velocity, acceleration]"""
         position, velocity = state
         acceleration = np.clip(action, -self.max_action, self.max_action)
-        return np.array([velocity, acceleration])
-
-    def step_rk4(self, state, action):
-        """Один шаг метода Рунге-Кутта 4-го порядка"""
-        k1 = self.dynamics(state, action)
-        k2 = self.dynamics(state + self.dt * k1 / 2, action)
-        k3 = self.dynamics(state + self.dt * k2 / 2, action)
-        k4 = self.dynamics(state + self.dt * k3, action)
-        return state + self.dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+        # Преобразуем acceleration в скаляр если это массив
+        if isinstance(acceleration, np.ndarray):
+            acceleration = float(acceleration.item()) if acceleration.size == 1 else float(acceleration[0])
+        return np.array([velocity, acceleration], dtype=np.float32)
 
     def step(self, action):
         """
@@ -70,9 +75,9 @@ class PointMassEnv:
         info : dict
         """
         if isinstance(action, np.ndarray):
-            action = action[0]
+            action = action.flatten()[0] if action.size > 0 else action[0]
 
-        # Интегрировать динамику
+        # Интегрировать динамику (используем RK4 из базового класса)
         next_state = self.step_rk4(self.state, action)
 
         # Вычислить награду
@@ -98,16 +103,6 @@ class PointMassEnv:
 
         return self.state.copy(), reward, done, info
 
-    def distance_to_goal(self, state=None):
-        """Расстояние до цели"""
-        if state is None:
-            state = self.state
-        return np.linalg.norm(state)
-
-    def render(self):
-        """Вывести текущее состояние"""
-        print(f"Step {self.steps}: state = {self.state}, distance = {self.distance_to_goal():.4f}")
-
 
 def pd_nominal_policy(max_action=5.0, kp=1.0, kd=1.0):
     """
@@ -131,6 +126,11 @@ def pd_nominal_policy(max_action=5.0, kp=1.0, kd=1.0):
 def test_env():
     """Тест среды"""
     env = PointMassEnv(dt=0.01, max_action=5.0, goal_radius=0.1)
+    
+    # Проверка state_dim и action_dim
+    print(f"state_dim: {env.state_dim}, action_dim: {env.action_dim}")
+    assert env.state_dim == 2, "state_dim должен быть 2"
+    assert env.action_dim == 1, "action_dim должен быть 1"
 
     # Тест с PD-контроллером
     nominal_policy = pd_nominal_policy(max_action=5.0, kp=1.0, kd=1.0)
@@ -151,6 +151,8 @@ def test_env():
             print(f"Distance to goal: {info['distance_to_goal']:.4f}")
             print(f"In goal region: {info['in_goal']}")
             break
+    
+    print("\nТест пройден!")
 
 
 if __name__ == "__main__":

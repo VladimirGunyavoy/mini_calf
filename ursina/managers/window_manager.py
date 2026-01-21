@@ -17,7 +17,7 @@ class WindowManager:
         "local": {"size": (2500, 1500), "position": (0, 0)},
         "main":  {"size": (2700, 1580), "position": (100, 100)},
         "top":   {"size": (1920, 1080), "position": (0, -1080)},
-        "left":  {"size": (1875, 970),  "position": (-1900, 420)},
+        "left":  {"size": (1875, 970),  "position": (-1900, 220)},
         "down":  {"size": (3000, 1700), "position": (-500, 1500)}
     }
     

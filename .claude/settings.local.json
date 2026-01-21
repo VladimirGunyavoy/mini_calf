@@ -13,7 +13,10 @@
       "Bash(python train_calf_visual.py:*)",
       "Bash(timeout 60 python:*)",
       "Bash(python test_agent_architecture.py:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(test:*)",
+      "Bash(taskkill:*)",
+      "Bash(timeout /t 5 py -3.12 main.py)"
     ]
   }
 }

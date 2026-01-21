@@ -20,16 +20,23 @@ class LineTrail:
     Эффективно: ~3-5 Entity на трейл (по числу смен режима)
     """
 
-    # Цвета режимов
-    MODE_COLORS = {
-        'td3': Vec4(0.2, 0.4, 1.0, 1),      # Синий
-        'relax': Vec4(0.2, 0.7, 0.3, 1),    # Зеленый
-        'fallback': Vec4(1.0, 0.5, 0.1, 1)  # Оранжевый
+    # Цвета режимов по умолчанию (для визуальных агентов - голубой)
+    DEFAULT_MODE_COLORS = {
+        'td3': Vec4(0.3, 0.7, 1.0, 1),      # Голубой (certified)
+        'relax': Vec4(0.2, 0.8, 0.3, 1),    # Зеленый
+        'fallback': Vec4(0.9, 0.2, 0.2, 1)  # Красный (nominal)
+    }
+
+    # Цвета для тренировочного агента (жёлтый)
+    TRAINING_MODE_COLORS = {
+        'td3': Vec4(1.0, 0.9, 0.0, 1),      # Жёлтый (certified)
+        'relax': Vec4(0.2, 0.8, 0.3, 1),    # Зеленый
+        'fallback': Vec4(0.9, 0.2, 0.2, 1)  # Красный (nominal)
     }
 
     MAX_SEGMENTS = 50  # Максимум сегментов (было 10, увеличено для частых переключений режима)
 
-    def __init__(self, max_points=150, line_thickness=2, decimation=3, rebuild_freq=5):
+    def __init__(self, max_points=150, line_thickness=2, decimation=3, rebuild_freq=5, mode_colors=None):
         """
         Parameters:
         -----------
@@ -40,26 +47,34 @@ class LineTrail:
         decimation : int
             Добавлять каждую N-ую точку
         rebuild_freq : int
-            (deprecated) Не используется - линии перестраиваются каждый кадр
+            Частота полного пересоздания mesh (каждые N добавлений)
+        mode_colors : dict, optional
+            Custom colors for modes {'td3': Vec4, 'relax': Vec4, 'fallback': Vec4}
         """
+        self.mode_colors = mode_colors if mode_colors else self.DEFAULT_MODE_COLORS
         self.max_points = max_points
         self.line_thickness = line_thickness
         self.decimation = decimation
-        
+        self.rebuild_freq = rebuild_freq
+
         # Кольцевой буфер позиций (реальных, без зума)
         self.positions = []  # List of np.array([x, y, z])
         self.modes = []      # List of mode strings
-        
+
         # Пул Entity для сегментов (создаём один раз!)
         self.segment_pool = []
         for _ in range(50):  # Увеличен пул до 50
             seg = Entity(visible=False)
             self.segment_pool.append(seg)
         self.active_segments = 0
-        
-        # Счётчик для decimation
+
+        # Счётчик для decimation и rebuild
         self.step_counter = 0
-        
+        self.rebuild_counter = 0
+
+        # Кэш: флаг изменений для предотвращения лишних rebuild
+        self.needs_rebuild = True
+
         # Трансформации зума
         self.a_transformation = 1.0
         self.b_translation = np.array([0, 0, 0], dtype=float)
@@ -111,48 +126,66 @@ class LineTrail:
         elif self.zoom_manager is not None:
             self.b_translation = self.zoom_manager.b_translation
 
-        # Перестраиваем линии каждый кадр (для синхронизации с агентами)
-        self._rebuild_segments()
+        # Отмечаем что нужен rebuild
+        self.needs_rebuild = True
+        self.rebuild_counter += 1
+
+        # Перестраиваем линии только каждые rebuild_freq добавлений (оптимизация!)
+        if self.rebuild_counter >= self.rebuild_freq:
+            self._rebuild_segments()
+            self.rebuild_counter = 0
     
     def _group_by_mode(self):
         """
-        Группировка последовательных точек по режиму.
+        Группировка последовательных точек по режиму (векторизованная версия).
         Возвращает список (mode, [indices]).
         """
         if len(self.positions) < 2:
             return []
-        
+
+        # Конвертируем modes в numpy array для векторизации
+        modes_array = np.array(self.modes)
+        n = len(modes_array)
+
+        # Найти индексы где режим меняется
+        # diff[i] = True если modes[i] != modes[i+1]
+        mode_changes = np.concatenate(([True], modes_array[1:] != modes_array[:-1], [True]))
+        change_indices = np.where(mode_changes)[0]
+
         groups = []
-        current_mode = self.modes[0]
-        current_indices = [0]
-        
-        for i in range(1, len(self.positions)):
-            mode = self.modes[i]
-            
-            if mode == current_mode:
-                current_indices.append(i)
+        for i in range(len(change_indices) - 1):
+            start_idx = change_indices[i]
+            end_idx = change_indices[i + 1]
+
+            # Режим для этой группы
+            current_mode = modes_array[start_idx]
+
+            # Индексы для этой группы (включая конечную точку для связи)
+            if i < len(change_indices) - 2:
+                # Не последняя группа - добавляем следующую точку для связи
+                indices = list(range(start_idx, end_idx + 1))
             else:
-                # Добавляем текущую точку для связи
-                current_indices.append(i)
-                groups.append((current_mode, current_indices.copy()))
-                # Новая группа начинается с текущей точки
-                current_mode = mode
-                current_indices = [i]
-        
-        # Последняя группа
-        if len(current_indices) >= 1:
-            groups.append((current_mode, current_indices))
-        
+                # Последняя группа
+                indices = list(range(start_idx, end_idx))
+
+            if len(indices) >= 2:
+                groups.append((current_mode, indices))
+
         return groups
     
     def _rebuild_segments(self):
         """Перестроить сегменты линий по группам режимов."""
+        # Проверяем нужен ли rebuild
+        if not self.needs_rebuild:
+            return
+
         # Сначала скрываем все сегменты
         for seg in self.segment_pool:
             seg.visible = False
 
         if len(self.positions) < 2:
             self.active_segments = 0
+            self.needs_rebuild = False
             return
 
         # Группируем по режимам
@@ -167,12 +200,12 @@ class LineTrail:
 
         for mode, indices in groups:
             if len(indices) >= 2 and segment_idx < self.MAX_SEGMENTS:
-                # Собираем точки для этого сегмента
-                points = []
-                for idx in indices:
-                    pos = self.positions[idx]
-                    t = pos * self.a_transformation + self.b_translation
-                    points.append(Vec3(t[0], t[1], t[2]))
+                # Векторизованная трансформация точек
+                positions_array = np.array([self.positions[idx] for idx in indices])
+                transformed = positions_array * self.a_transformation + self.b_translation
+
+                # Конвертируем в Vec3 список
+                points = [Vec3(t[0], t[1], t[2]) for t in transformed]
 
                 # Обновляем Entity из пула
                 seg = self.segment_pool[segment_idx]
@@ -183,19 +216,22 @@ class LineTrail:
 
                 # Создаем новый mesh
                 seg.model = Mesh(vertices=points, mode='line', thickness=self.line_thickness)
-                seg.color = self.MODE_COLORS.get(mode, self.MODE_COLORS['td3'])
+                seg.color = self.mode_colors.get(mode, self.mode_colors['td3'])
                 seg.visible = True
 
                 segment_idx += 1
 
         self.active_segments = segment_idx
+        self.needs_rebuild = False
     
     def clear(self):
         """Очистить траекторию."""
         self.positions = []
         self.modes = []
         self.step_counter = 0
+        self.rebuild_counter = 0
         self.active_segments = 0
+        self.needs_rebuild = True
         for seg in self.segment_pool:
             seg.visible = False
             if seg.model is not None:
@@ -209,6 +245,7 @@ class LineTrail:
         """Применить трансформацию зума."""
         self.a_transformation = a
         self.b_translation = b
+        self.needs_rebuild = True
         self._rebuild_segments()
     
     def set_zoom_manager(self, zoom_manager):

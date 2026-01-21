@@ -94,10 +94,15 @@ class CALFController:
         # Relax probability
         self.P_relax = lambda_relax
 
-        # Statistics
+        # Statistics (global - accumulates across saves/loads)
         self.total_steps = 0
         self.nominal_interventions = 0
         self.relax_events = 0
+
+        # Session statistics (resets each run)
+        self.session_steps = 0
+        self.session_interventions = 0
+        self.session_relax_events = 0
 
         # Certified Q tracking
         self.q_cert_history = []
@@ -202,6 +207,7 @@ class CALFController:
         5. Обновить P_relax
         """
         self.total_steps += 1
+        self.session_steps += 1
 
         # 1. Действие от актора
         action_actor = self.td3.select_action(state, noise=exploration_noise)
@@ -223,11 +229,13 @@ class CALFController:
                 # Использовать номинальную политику π₀
                 action = self.nominal_policy(state)
                 self.nominal_interventions += 1
+                self.session_interventions += 1
                 self.action_sources.append('nominal')
             else:
                 # Расслабиться - использовать актор
                 action = action_actor
                 self.relax_events += 1
+                self.session_relax_events += 1
                 self.action_sources.append('relax')
 
         # 3. Обновить P_relax
@@ -345,12 +353,12 @@ class CALFController:
         self.P_relax = self.lambda_relax
 
     def get_statistics(self):
-        """Получить статистику работы CALF"""
+        """Получить глобальную статистику работы CALF (за всё время)"""
         total = max(1, self.total_steps)
         intervention_rate = self.nominal_interventions / total
         relax_rate = self.relax_events / total
         certification_rate = 1.0 - intervention_rate - relax_rate
-        
+
         return {
             'total_steps': self.total_steps,
             'nominal_interventions': self.nominal_interventions,
@@ -360,6 +368,23 @@ class CALFController:
             'relax_rate': relax_rate,
             'certification_rate': certification_rate,
             'q_cert_history': self.q_cert_history.copy()
+        }
+
+    def get_session_statistics(self):
+        """Получить статистику текущей сессии (с момента запуска)"""
+        total = max(1, self.session_steps)
+        intervention_rate = self.session_interventions / total
+        relax_rate = self.session_relax_events / total
+        certification_rate = 1.0 - intervention_rate - relax_rate
+
+        return {
+            'session_steps': self.session_steps,
+            'session_interventions': self.session_interventions,
+            'session_relax_events': self.session_relax_events,
+            'P_relax': self.P_relax,
+            'intervention_rate': intervention_rate,
+            'relax_rate': relax_rate,
+            'certification_rate': certification_rate,
         }
 
     def get_q_cert_history(self):

@@ -65,8 +65,10 @@ class CriticHeatmap:
         # Create grid
         self.x_grid, self.v_grid = self._create_grid()
 
-        # Initial Q-values
+        # Initial Q-values and cache
         self.q_values = np.zeros((grid_size, grid_size))
+        self.q_values_cached = None  # Cache Q-values between updates
+        self.cache_valid = False  # Flag to track if cache is valid
         self.q_min = 0.0
         self.q_max = 1.0
         
@@ -93,33 +95,38 @@ class CriticHeatmap:
         return x_grid, v_grid
 
     def _compute_q_values(self):
-        """Compute Q-values for all grid points"""
+        """Compute Q-values for all grid points (batch inference - already optimized)"""
         # Flatten grid
         states = np.stack([self.x_grid.flatten(), self.v_grid.flatten()], axis=1)
 
         # Get Q-values from critic (use zero action for state-value estimation)
+        # OPTIMIZED: Single batch forward pass instead of N individual calls
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states).to(self.td3_agent.device)
             actions_tensor = torch.zeros(len(states), self.td3_agent.action_dim).to(self.td3_agent.device)
 
-            # Use Q1 from critic
+            # Use Q1 from critic (batch inference)
             q1, q2 = self.td3_agent.critic(states_tensor, actions_tensor)
             q_values = torch.min(q1, q2).cpu().numpy().flatten()
 
         # Reshape to grid
         q_values = q_values.reshape(self.grid_size, self.grid_size)
 
+        # Cache Q-values for interpolation
+        self.q_values_cached = q_values.copy()
+        self.cache_valid = True
+
         # Square Q-values first (before finding min/max)
         q_squared = q_values ** 2
-        
+
         # Update min/max with exponential smoothing (on squared values)
         current_min = q_squared.min()
         current_max = q_squared.max()
-        
+
         # Smooth update (reduces jumps)
         self.q_min_smooth = self.smooth_alpha * current_min + (1 - self.smooth_alpha) * self.q_min_smooth
         self.q_max_smooth = self.smooth_alpha * current_max + (1 - self.smooth_alpha) * self.q_max_smooth
-        
+
         # Use smoothed values for normalization
         self.q_min = self.q_min_smooth
         self.q_max = self.q_max_smooth
@@ -390,6 +397,8 @@ class CriticHeatmap:
         if self.surface_entity is not None:
             destroy(self.surface_entity)
             self.surface_entity = None
+        self.cache_valid = False
+        self.q_values_cached = None
 
     def get_q_range(self):
         """Get current Q-value range"""
@@ -533,59 +542,62 @@ class CriticHeatmap:
     def _interpolate_q_from_grid(self, state):
         """
         Interpolate Q-value from cached grid using bilinear interpolation
-        
+
         Parameters:
         -----------
         state : np.ndarray
             State vector [x, v]
-        
+
         Returns:
         --------
         float
             Interpolated Q-value
-        
+
         Note:
         -----
         Grid indexing: q_values[i, j] where i=row (v-axis), j=col (x-axis)
         meshgrid creates: x_grid[i,j]=x[j], v_grid[i,j]=v[i]
         """
+        # Use cached Q-values if available
+        q_grid = self.q_values_cached if self.cache_valid and self.q_values_cached is not None else self.q_values
+
         x, v = state[0], state[1]
-        
+
         # Clamp to grid bounds
         x = np.clip(x, self.x_range[0], self.x_range[1])
         v = np.clip(v, self.v_range[0], self.v_range[1])
-        
+
         # Convert to grid coordinates (continuous)
         x_norm = (x - self.x_range[0]) / (self.x_range[1] - self.x_range[0])
         v_norm = (v - self.v_range[0]) / (self.v_range[1] - self.v_range[0])
-        
+
         # Grid indices (floating point)
         # col_float corresponds to x (2nd dimension, j)
         # row_float corresponds to v (1st dimension, i)
         col_float = x_norm * (self.grid_size - 1)
         row_float = v_norm * (self.grid_size - 1)
-        
+
         # Get surrounding grid points
         col0 = int(np.floor(col_float))
         col1 = min(col0 + 1, self.grid_size - 1)
         row0 = int(np.floor(row_float))
         row1 = min(row0 + 1, self.grid_size - 1)
-        
+
         # Interpolation weights
         wx = col_float - col0
         wv = row_float - row0
-        
+
         # Bilinear interpolation: q_values[row, col]
-        q00 = self.q_values[row0, col0]  # (v0, x0)
-        q01 = self.q_values[row0, col1]  # (v0, x1)
-        q10 = self.q_values[row1, col0]  # (v1, x0)
-        q11 = self.q_values[row1, col1]  # (v1, x1)
-        
+        q00 = q_grid[row0, col0]  # (v0, x0)
+        q01 = q_grid[row0, col1]  # (v0, x1)
+        q10 = q_grid[row1, col0]  # (v1, x0)
+        q11 = q_grid[row1, col1]  # (v1, x1)
+
         q_interp = (1 - wx) * (1 - wv) * q00 + \
                    wx * (1 - wv) * q01 + \
                    (1 - wx) * wv * q10 + \
                    wx * wv * q11
-        
+
         return q_interp
     
     def apply_transform(self, a, b, **kwargs):
