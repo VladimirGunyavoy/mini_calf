@@ -1,14 +1,26 @@
 """
 CALF Training - Clean Architecture (Stage 3)
 Main entry point with modular component separation
+
+Supports multiple systems:
+- point_mass: 1D position + velocity (default)
+- differential_drive: 2D position + orientation
 """
 
 import sys
+import argparse
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import torch
+
+# Parse command line arguments FIRST
+parser = argparse.ArgumentParser(description='CALF Training with Visualization')
+parser.add_argument('--system', type=str, default='differential_drive',
+                    choices=['point_mass', 'differential_drive'],
+                    help='System type: point_mass or differential_drive')
+args = parser.parse_args()
 
 # Import configuration
 from config import AppConfig
@@ -18,11 +30,13 @@ from core import CALFApplication
 
 # Import training components
 from training import CALFTrainer, TrainingVisualizer
+from training.reward_plotter import RewardPlotter
 
 # Import RL components
 from RL.calf import CALFController
 from RL.td3 import ReplayBuffer
 from RL.simple_env import PointMassEnv, pd_nominal_policy
+from RL.differential_drive_env import DifferentialDriveEnv, move_to_point_policy
 
 # Import visuals
 from visuals import LineTrail, CriticHeatmap, GridOverlay
@@ -37,13 +51,16 @@ from utils import PerformanceProfiler
 # Load configuration (can easily switch presets here)
 config = AppConfig.from_preset('medium')
 
+# Set system type from command line argument
+config.training.system_type = args.system
+
 # Override specific parameters if needed
+config.training.max_steps_per_episode = 1000  # Episode length
 # config.training.num_episodes = 1000
 # config.visualization.n_agents = 10
 
 # Resume training from checkpoint
 RESUME_TRAINING = True
-RESUME_CHECKPOINT = "trained_calf_final.pth"
 
 # Set random seeds
 SEED = 42
@@ -67,9 +84,18 @@ app = CALFApplication(config).setup()
 # Create training environment
 env = app.create_training_env()
 
-# Create nominal safe policy (PD controller)
-nominal_policy = pd_nominal_policy(max_action=env.max_action, kp=2.0, kd=0.4)
-print(f"\nNominal Policy: PD Controller (kp=2.0, kd=0.4)")
+# Create nominal safe policy based on system type
+if config.training.system_type == 'point_mass':
+    nominal_policy = pd_nominal_policy(max_action=env.max_action, kp=2.0, kd=0.4)
+    print(f"\nNominal Policy: PD Controller (kp=2.0, kd=0.4)")
+elif config.training.system_type == 'differential_drive':
+    nominal_policy = move_to_point_policy(
+        max_v=config.training.max_v,
+        max_omega=config.training.max_omega
+    )
+    print(f"\nNominal Policy: Move-to-Point (max_v={config.training.max_v}, max_omega={config.training.max_omega})")
+else:
+    raise ValueError(f"Unknown system type: {config.training.system_type}")
 
 # ============================================================================
 # CALF AGENT SETUP
@@ -103,28 +129,61 @@ print(f"  Kappa coefficients: [{config.training.kappa_low_coef}, {config.trainin
 print(f"  Reward scale: {config.training.reward_scale}x")
 
 # Load checkpoint if resuming
-if RESUME_TRAINING:
-    checkpoint_path = Path(__file__).parent / RESUME_CHECKPOINT
-    if checkpoint_path.exists():
-        calf_agent.load(str(checkpoint_path))
-        print(f"\n{'='*70}")
-        print(f"RESUMING TRAINING FROM CHECKPOINT")
-        print(f"{'='*70}")
-        print(f"Loaded checkpoint: {checkpoint_path}")
+def find_latest_checkpoint(system_type):
+    """Find the latest checkpoint for given system type."""
+    checkpoints_dir = Path(__file__).parent / "checkpoints"
+    final_path = Path(__file__).parent / f"trained_calf_{system_type}.pth"
+    
+    # Look for episode checkpoints
+    if checkpoints_dir.exists():
+        pattern = f"calf_{system_type}_episode_*.pth"
+        checkpoints = list(checkpoints_dir.glob(pattern))
+        
+        if checkpoints:
+            # Extract episode numbers and find max
+            def get_episode(p):
+                try:
+                    return int(p.stem.split('_episode_')[-1])
+                except:
+                    return 0
+            
+            latest = max(checkpoints, key=get_episode)
+            return latest, get_episode(latest)
+    
+    # Fall back to final checkpoint
+    if final_path.exists():
+        return final_path, None
+    
+    return None, None
 
-        # Reset P_relax to 0 for strict certification
-        calf_agent.P_relax = 0.0
-        print(f"Set P_relax = 0.0 (no relaxation - strict mode)")
+checkpoint_path, checkpoint_episode = find_latest_checkpoint(config.training.system_type)
 
-        stats = calf_agent.get_statistics()
-        print(f"Loaded statistics:")
-        print(f"  Total steps: {stats['total_steps']}")
-        print(f"  Certification rate: {stats['certification_rate']:.3f}")
-        print(f"  Intervention rate: {stats['intervention_rate']:.3f}")
-        print(f"  Relax rate: {stats['relax_rate']:.3f}")
-    else:
-        print(f"\nWARNING: Checkpoint not found at {checkpoint_path}")
-        print(f"Starting training from scratch...")
+if RESUME_TRAINING and checkpoint_path is not None:
+    calf_agent.load(str(checkpoint_path))
+    print(f"\n{'='*70}")
+    print(f"RESUMING TRAINING FROM CHECKPOINT")
+    print(f"{'='*70}")
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    if checkpoint_episode:
+        print(f"Episode: {checkpoint_episode}")
+
+    # Reset P_relax to 0 for strict certification
+    calf_agent.P_relax = 0.0
+    print(f"Set P_relax = 0.0 (no relaxation - strict mode)")
+
+    stats = calf_agent.get_statistics()
+    print(f"Loaded statistics:")
+    print(f"  Total steps: {stats['total_steps']}")
+    print(f"  Certification rate: {stats['certification_rate']:.3f}")
+    print(f"  Intervention rate: {stats['intervention_rate']:.3f}")
+    print(f"  Relax rate: {stats['relax_rate']:.3f}")
+else:
+    print(f"\n{'='*70}")
+    print(f"STARTING FRESH TRAINING ({config.training.system_type})")
+    print(f"{'='*70}")
+    if RESUME_TRAINING:
+        print(f"No checkpoint found for {config.training.system_type}")
+    print(f"Training from scratch...")
 
 # Replay buffer
 replay_buffer = ReplayBuffer(
@@ -145,6 +204,15 @@ trainer = CALFTrainer(
     config=config.training
 )
 
+# Reward plotter (saves PNG to plots/ folder)
+reward_plotter = RewardPlotter(
+    output_dir='plots',
+    filename='reward_plot.png',
+    update_frequency=5,  # Update every 5 episodes
+    window_size=10
+)
+print(f"Reward plotter initialized: plots/reward_plot.png (updates every 5 episodes)")
+
 # ============================================================================
 # VISUALIZER SETUP
 # ============================================================================
@@ -153,7 +221,8 @@ visualizer = TrainingVisualizer(
     object_manager=app.object_manager,
     zoom_manager=app.zoom_manager,
     config=config.visualization,
-    device=app.device
+    device=app.device,
+    system_type=config.training.system_type
 )
 
 # Setup visual agents
@@ -195,7 +264,10 @@ if config.visualization.heatmap_enabled:
         v_range=(-config.training.boundary_limit, config.training.boundary_limit),
         height_scale=config.visualization.heatmap_height_scale,
         update_frequency=config.visualization.heatmap_update_freq,
-        surface_epsilon=config.visualization.agent_height_epsilon
+        surface_epsilon=config.visualization.agent_height_epsilon,
+        state_dim=env.state_dim,
+        action_dim=env.action_dim,
+        fixed_theta=0.0  # For differential_drive: show slice at theta=0
     )
     app.zoom_manager.register_object(critic_heatmap, 'critic_heatmap')
 
@@ -270,8 +342,17 @@ def update():
         # Episode termination
         if done:
             with profiler.measure('episode_end'):
+                # Save episode data for plotting BEFORE handle_episode_end resets values
+                episode_reward = trainer.episode_reward
+                episode_length = trainer.episode_length
+                success = info.get('in_goal', False)
+
                 # Handle episode end
                 new_state = trainer.handle_episode_end(info)
+
+                # Update reward plot
+                reward_plotter.add_episode(episode_reward, episode_length, success)
+                reward_plotter.update_plot()
 
                 # Clear visualizations
                 visualizer.clear_training_agent_trail()
@@ -318,6 +399,7 @@ def update():
 
         # Check if training is complete
         if trainer.is_complete():
+            reward_plotter.save_final()  # Save final plot and data
             trainer.finalize()
             app.quit()
 
@@ -370,6 +452,30 @@ def input(key):
         profiler.reset()
         profiler_text.text = "Profiler: RESET"
         print("\nProfiler statistics reset")
+
+# ============================================================================
+# AUTO-SAVE ON EXIT
+# ============================================================================
+
+import atexit
+
+def save_on_exit():
+    """Save model and plot when application exits."""
+    print("\n" + "="*70)
+    print("SAVING ON EXIT...")
+    print("="*70)
+    
+    # Save model
+    system_type = config.training.system_type
+    final_path = Path(f"trained_calf_{system_type}.pth")
+    calf_agent.save(str(final_path))
+    print(f"Model saved: {final_path}")
+    
+    # Save final plot
+    reward_plotter.save_final()
+    print("Plot and data saved to plots/")
+
+atexit.register(save_on_exit)
 
 # ============================================================================
 # START APPLICATION

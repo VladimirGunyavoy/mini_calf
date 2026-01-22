@@ -42,6 +42,14 @@ class TrainingConfig:
     goal_epsilon: float = 0.05  # Distance to goal for early termination
     boundary_limit: float = 5.0  # Position boundary for early termination
 
+    # System type: 'point_mass' or 'differential_drive'
+    system_type: str = 'point_mass'
+
+    # Differential drive specific parameters
+    max_v: float = 1.0  # Max linear velocity
+    max_omega: float = 2.0  # Max angular velocity
+    goal_angle_tolerance: float = 0.1  # Goal angle tolerance (radians)
+
     @classmethod
     def from_preset(cls, preset_name: str) -> 'TrainingConfig':
         """

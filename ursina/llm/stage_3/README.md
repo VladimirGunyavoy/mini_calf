@@ -156,25 +156,30 @@
 - `../../physics/base_system.py` - базовый класс физики (Part 4)
 - `../../physics/differential_drive_system.py` - новая физика (Part 4)
 - `../../visuals/oriented_agent.py` - cone визуализация (Part 5)
+- `../../training/reward_plotter.py` - график reward в PNG (Post Stage 3)
 
 ---
 
 ## Метрики успеха Stage 3
 
 ### Функциональность
-- [ ] DifferentialDriveEnv создана и работает
-- [ ] Номинальная политика стабилизирует систему
-- [ ] Визуализация показывает ориентацию (cone)
-- [ ] Heatmap работает при theta=0
+- [x] DifferentialDriveEnv создана и работает
+- [x] Номинальная политика стабилизирует систему
+- [x] Визуализация показывает ориентацию (cone)
+- [x] Heatmap работает при theta=0
 
 ### Совместимость
-- [ ] Point Mass не сломан (регрессия)
-- [ ] Выбор системы через config/CLI
-- [ ] Обе системы обучаются с CALF
+- [x] Point Mass не сломан (регрессия)
+- [x] Выбор системы через config/CLI
+- [x] Обе системы обучаются с CALF
 
 ### Архитектура
-- [ ] Базовые классы (BaseEnv, BaseDynamicalSystem)
-- [ ] Легко добавить третью систему в будущем
+- [x] Базовые классы (BaseEnv, BaseDynamicalSystem)
+- [x] Легко добавить третью систему в будущем
+
+### Дополнительно (Post Stage 3)
+- [x] RewardPlotter - график reward сохраняется в `plots/reward_plot.png`
+- [x] Баг add_visual_agent() исправлен для differential_drive
 
 ---
 

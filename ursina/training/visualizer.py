@@ -5,7 +5,8 @@ Manages visualization of training agents, heatmaps, and UI displays
 
 import numpy as np
 import torch
-from ursina import Text, Vec4
+from ursina import Text, Vec4, Entity
+from ursina.models.procedural.cone import Cone
 
 from visuals import LineTrail
 
@@ -13,7 +14,7 @@ from visuals import LineTrail
 class VisualAgent:
     """Visual agent with integrated trajectory (ring buffer)"""
 
-    def __init__(self, object_manager, zoom_manager, agent_id, max_trail_length=200, decimation=1, point_color=None, trail_colors=None):
+    def __init__(self, object_manager, zoom_manager, agent_id, max_trail_length=200, decimation=1, point_color=None, trail_colors=None, system_type='point_mass'):
         """
         Initialize visual agent.
 
@@ -30,23 +31,58 @@ class VisualAgent:
         decimation : int
             Trail decimation factor (1 = no decimation)
         point_color : Vec4, optional
-            Agent sphere color (default: light blue)
+            Agent color (default: light blue)
         trail_colors : dict, optional
             Custom trail colors {'td3': Vec4, 'relax': Vec4, 'fallback': Vec4}
+        system_type : str
+            'point_mass' (sphere) or 'differential_drive' (cone with orientation)
         """
         self.zoom_manager = zoom_manager
+        self.system_type = system_type
 
-        # Agent sphere
+        # Agent color
         if point_color is None:
             point_color = Vec4(0.3, 0.7, 1.0, 1)  # Light blue (default)
 
-        self.visual_point = object_manager.create_object(
-            name=f'calf_point_{agent_id}',
-            model='sphere',
-            position=(0, 0, 0),
-            scale=0.06,
-            color_val=point_color
-        )
+        # Choose model based on system type
+        if system_type == 'differential_drive':
+            # Cone for oriented agent - use procedural Cone model
+            cone_mesh = Cone(resolution=8, radius=0.5, height=1)
+            self.visual_point = Entity(
+                model=cone_mesh,
+                position=(0, 0, 0),
+                scale=(0.1, 0.15, 0.1),  # (width, height, depth)
+                color=point_color
+            )
+            # Rotate cone to point along movement direction
+            # Cone points up by default (Y+), rotate to point along X+
+            self.visual_point.rotation_z = -90
+            self._orientation = 0.0
+            
+            # Add real_position attribute and apply_transform method for zoom support
+            self.visual_point.real_position = np.array([0, 0, 0], dtype=float)
+            self.visual_point.base_scale = np.array([0.1, 0.15, 0.1], dtype=float)
+            
+            def apply_transform(a, b, spores_scale=1.0):
+                from ursina import Vec3
+                transformed = a * self.visual_point.real_position + b
+                self.visual_point.position = Vec3(*transformed)
+                # Apply scale with spores_scale
+                scaled = self.visual_point.base_scale * spores_scale
+                self.visual_point.scale = Vec3(*scaled)
+            self.visual_point.apply_transform = apply_transform
+            
+            # Register with zoom manager for zoom tracking
+            zoom_manager.register_object(self.visual_point, f'calf_point_{agent_id}')
+        else:
+            # Sphere for point mass
+            self.visual_point = object_manager.create_object(
+                name=f'calf_point_{agent_id}',
+                model='sphere',
+                position=(0, 0, 0),
+                scale=0.06,
+                color_val=point_color
+            )
 
         # Ring buffer trajectory (LineTrail)
         self.trail = LineTrail(
@@ -63,7 +99,7 @@ class VisualAgent:
         # Real position (for zoom)
         self.real_position = np.array([0, 0, 0], dtype=float)
 
-    def update_position(self, position, mode='td3'):
+    def update_position(self, position, mode='td3', orientation=None):
         """
         Update agent position and add point to trajectory.
 
@@ -73,6 +109,8 @@ class VisualAgent:
             Position (x, y, z)
         mode : str
             Mode for color coding ('td3', 'relax', 'fallback'/'nominal')
+        orientation : float, optional
+            Orientation angle in radians (for differential_drive)
         """
         # Convert position to numpy array
         if isinstance(position, (tuple, list)):
@@ -87,16 +125,25 @@ class VisualAgent:
         a_trans = self.zoom_manager.a_transformation
         b_trans = self.zoom_manager.b_translation
 
-        # Update sphere position
+        # Update agent position
         self.visual_point.real_position = self.real_position
         self.visual_point.apply_transform(a_trans, b_trans)
+
+        # Update orientation for differential_drive (cone)
+        if self.system_type == 'differential_drive' and orientation is not None:
+            self._orientation = orientation
+            # Cone points along +X after rotation_z = -90
+            # theta=0 -> points along +X in world coords
+            # rotation_y rotates around Y axis (vertical)
+            angle_deg = np.degrees(orientation)
+            self.visual_point.rotation_y = -angle_deg
 
         # Mode mapping: CALF uses 'nominal', visualization uses 'fallback'
         display_mode = mode
         if mode == 'nominal':
             display_mode = 'fallback'
 
-        # Update sphere color based on mode
+        # Update agent color based on mode
         if display_mode == 'td3':
             self.visual_point.color = Vec4(0.3, 0.7, 1.0, 1)  # Light blue
         elif display_mode == 'relax':
@@ -122,7 +169,7 @@ class TrainingVisualizer:
     Manages visualization of training: visual agents, heatmap, UI text.
     """
 
-    def __init__(self, object_manager, zoom_manager, config, device):
+    def __init__(self, object_manager, zoom_manager, config, device, system_type='point_mass'):
         """
         Initialize visualizer.
 
@@ -136,11 +183,14 @@ class TrainingVisualizer:
             Visualization configuration
         device : torch.device
             PyTorch device for computations
+        system_type : str
+            'point_mass' or 'differential_drive'
         """
         self.object_manager = object_manager
         self.zoom_manager = zoom_manager
         self.config = config
         self.device = device
+        self.system_type = system_type
 
         # Visual agents and environments
         self.visual_agents = []
@@ -175,7 +225,7 @@ class TrainingVisualizer:
 
         Parameters:
         -----------
-        visual_envs : list[PointMassEnv]
+        visual_envs : list[BaseEnv]
             Visual environments
         """
         self.visual_envs = visual_envs
@@ -188,14 +238,15 @@ class TrainingVisualizer:
                 zoom_manager=self.zoom_manager,
                 agent_id=i,
                 max_trail_length=self.config.trail_max_length,
-                decimation=self.config.trail_decimation
+                decimation=self.config.trail_decimation,
+                system_type=self.system_type
             )
             self.visual_agents.append(agent)
 
         print(f"{len(self.visual_agents)} visual agents initialized")
 
     def setup_training_agent(self):
-        """Setup training agent visualization (yellow sphere with yellow trail)."""
+        """Setup training agent visualization (yellow sphere/cone with yellow trail)."""
         # Yellow trail colors for training agent
         training_trail_colors = {
             'td3': Vec4(1.0, 0.9, 0.0, 1),      # Yellow (certified)
@@ -209,7 +260,8 @@ class TrainingVisualizer:
             max_trail_length=self.config.trail_max_length,
             decimation=1,
             point_color=Vec4(1.0, 0.9, 0.0, 1),  # Yellow
-            trail_colors=training_trail_colors
+            trail_colors=training_trail_colors,
+            system_type=self.system_type
         )
         print("Training agent visualization initialized")
 
@@ -248,13 +300,13 @@ class TrainingVisualizer:
         # Legend text
         self.legend_text = Text(
             text='TRAIL COLORS:\n'
-                 '<blue>Blue</blue> = TD3 (certified)\n'
+                 '<cyan>Cyan</cyan> = TD3 (certified)\n'
                  '<green>Green</green> = Relax (uncertified, relaxed)\n'
-                 '<orange>Orange</orange> = Fallback (nominal policy)\n'
+                 '<red>Red</red> = Fallback (nominal policy)\n'
                  '\n'
                  'AGENTS:\n'
-                 '<color:rgb(255,128,0)>Orange point</color> = Training agent (CALF mode switching)\n'
-                 '<blue>Blue points</blue> = Visual agents (pure TD3 policy)',
+                 '<yellow>Yellow point</yellow> = Training agent (CALF mode switching)\n'
+                 '<cyan>Cyan points</cyan> = Visual agents (pure TD3 policy)',
             position=(0.4, 0.45),
             scale=0.7,
             origin=(-0.5, 0.5),
@@ -334,8 +386,14 @@ class TrainingVisualizer:
 
         # Get height for training agent
         train_agent_height = self.get_agent_height(state)
-        x, v = state[0], state[1]
-        train_position = (x, train_agent_height, v)
+        
+        # Convert state to 3D position based on system type
+        if self.system_type == 'differential_drive':
+            x, y_world, theta = state[0], state[1], state[2]
+            train_position = (x, train_agent_height, y_world)
+        else:
+            x, v = state[0], state[1]
+            train_position = (x, train_agent_height, v)
 
         # Determine mode from last action source
         if len(calf_agent.action_sources) > 0:
@@ -343,7 +401,13 @@ class TrainingVisualizer:
         else:
             mode = 'td3'
 
-        self.training_agent.update_position(train_position, mode=mode)
+        # Update position with orientation for differential_drive
+        if self.system_type == 'differential_drive':
+            theta = state[2] if len(state) > 2 else 0.0
+            self.training_agent.update_position(train_position, mode=mode, orientation=theta)
+        else:
+            self.training_agent.update_position(train_position, mode=mode)
+            
         # Training agent: yellow for certified/relax, red for nominal intervention
         if mode == 'nominal':
             self.training_agent.visual_point.color = Vec4(0.9, 0.2, 0.2, 1)  # Red
@@ -490,11 +554,19 @@ class TrainingVisualizer:
             vis_done = vis_done_flags[i]
             mode = vis_modes[i]
 
-            x, v = vis_next_state[0], vis_next_state[1]
-            y = vis_heights[i]
-            position = (x, y, v)
-
-            self.visual_agents[i].update_position(position, mode=mode)
+            # Convert state to 3D position based on system type
+            if self.system_type == 'differential_drive':
+                # [x, y, theta] -> (x, height, y) in Ursina
+                x, y_world, theta = vis_next_state[0], vis_next_state[1], vis_next_state[2]
+                y_height = vis_heights[i]
+                position = (x, y_height, y_world)
+                self.visual_agents[i].update_position(position, mode=mode, orientation=theta)
+            else:
+                # [x, v] -> (x, height, v) for phase space visualization
+                x, v = vis_next_state[0], vis_next_state[1]
+                y = vis_heights[i]
+                position = (x, y, v)
+                self.visual_agents[i].update_position(position, mode=mode)
 
             # Continuous flow: reset immediately when done
             if vis_done:
@@ -504,10 +576,16 @@ class TrainingVisualizer:
 
                 # Update to new starting position
                 new_state = self.visual_envs[i].state
-                x, v = new_state[0], new_state[1]
-                y = self.get_agent_height(new_state)
-                new_position = (x, y, v)
-                self.visual_agents[i].update_position(new_position, mode='td3')
+                y_height = self.get_agent_height(new_state)
+                
+                if self.system_type == 'differential_drive':
+                    x, y_world, theta = new_state[0], new_state[1], new_state[2]
+                    new_position = (x, y_height, y_world)
+                    self.visual_agents[i].update_position(new_position, mode='td3', orientation=theta)
+                else:
+                    x, v = new_state[0], new_state[1]
+                    new_position = (x, y_height, v)
+                    self.visual_agents[i].update_position(new_position, mode='td3')
 
     def update_heatmap(self, total_steps):
         """
@@ -663,12 +741,16 @@ Press P to pause'''
 
     def add_visual_agent(self):
         """Add one visual agent dynamically."""
-        from RL.simple_env import PointMassEnv
-
         print(f"\n[Agents] Adding 1 visual agent...")
 
-        # Create new environment
-        new_env = PointMassEnv(dt=0.01, max_action=5.0, goal_radius=0.1)
+        # Create new environment based on system type
+        if self.system_type == 'differential_drive':
+            from RL.differential_drive_env import DifferentialDriveEnv
+            new_env = DifferentialDriveEnv(dt=0.01, max_v=1.0, max_omega=2.0, goal_radius=0.1)
+        else:
+            from RL.simple_env import PointMassEnv
+            new_env = PointMassEnv(dt=0.01, max_action=5.0, goal_radius=0.1)
+        
         new_env.reset()
         self.visual_envs.append(new_env)
 
@@ -679,7 +761,8 @@ Press P to pause'''
             zoom_manager=self.zoom_manager,
             agent_id=agent_id,
             max_trail_length=self.config.trail_max_length,
-            decimation=self.config.trail_decimation
+            decimation=self.config.trail_decimation,
+            system_type=self.system_type
         )
         self.visual_agents.append(new_agent)
         self.visual_step_counters.append(0)

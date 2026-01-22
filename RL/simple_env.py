@@ -7,7 +7,11 @@ Dynamics: x_dot = [velocity, acceleration]
 """
 
 import numpy as np
-from .base_env import BaseEnv
+
+try:
+    from .base_env import BaseEnv
+except ImportError:
+    from base_env import BaseEnv
 
 
 class PointMassEnv(BaseEnv):
@@ -152,7 +156,7 @@ def test_env():
             print(f"In goal region: {info['in_goal']}")
             break
     
-    print("\nТест пройден!")
+    print("\nTest passed!")
 
 
 if __name__ == "__main__":

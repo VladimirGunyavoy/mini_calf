@@ -24,7 +24,10 @@ class CriticHeatmap:
                  v_range=(-5, 5),
                  height_scale=2.0,
                  update_frequency=100,
-                 surface_epsilon=0.15):
+                 surface_epsilon=0.15,
+                 state_dim=2,
+                 action_dim=1,
+                 fixed_theta=0.0):
         """
         Parameters:
         -----------
@@ -35,13 +38,19 @@ class CriticHeatmap:
         x_range : tuple
             (min, max) for position axis
         v_range : tuple
-            (min, max) for velocity axis
+            (min, max) for velocity/y axis
         height_scale : float
             Scale factor for height visualization
         update_frequency : int
             Update heatmap every N simulation steps
         surface_epsilon : float
             Height offset for surface above ground (epsilon)
+        state_dim : int
+            State dimension (2 for point_mass, 3 for differential_drive)
+        action_dim : int
+            Action dimension (1 for point_mass, 2 for differential_drive)
+        fixed_theta : float
+            Fixed theta value for 3D states (only used when state_dim=3)
         """
         self.td3_agent = td3_agent
         self.grid_size = grid_size
@@ -50,6 +59,9 @@ class CriticHeatmap:
         self.height_scale = height_scale
         self.update_frequency = update_frequency
         self.surface_epsilon = surface_epsilon
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.fixed_theta = fixed_theta
 
         self.step_counter = 0
         self.surface_entity = None
@@ -97,13 +109,26 @@ class CriticHeatmap:
     def _compute_q_values(self):
         """Compute Q-values for all grid points (batch inference - already optimized)"""
         # Flatten grid
-        states = np.stack([self.x_grid.flatten(), self.v_grid.flatten()], axis=1)
+        n_points = self.x_grid.size
+        
+        if self.state_dim == 2:
+            # Point mass: [x, v]
+            states = np.stack([self.x_grid.flatten(), self.v_grid.flatten()], axis=1)
+        elif self.state_dim == 3:
+            # Differential drive: [x, y, theta] - use fixed_theta for visualization
+            states = np.stack([
+                self.x_grid.flatten(),
+                self.v_grid.flatten(),  # v_grid becomes y for differential_drive
+                np.full(n_points, self.fixed_theta)
+            ], axis=1)
+        else:
+            raise ValueError(f"Unsupported state_dim: {self.state_dim}")
 
         # Get Q-values from critic (use zero action for state-value estimation)
         # OPTIMIZED: Single batch forward pass instead of N individual calls
         with torch.no_grad():
             states_tensor = torch.FloatTensor(states).to(self.td3_agent.device)
-            actions_tensor = torch.zeros(len(states), self.td3_agent.action_dim).to(self.td3_agent.device)
+            actions_tensor = torch.zeros(len(states), self.action_dim).to(self.td3_agent.device)
 
             # Use Q1 from critic (batch inference)
             q1, q2 = self.td3_agent.critic(states_tensor, actions_tensor)

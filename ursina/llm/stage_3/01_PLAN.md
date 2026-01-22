@@ -9,14 +9,14 @@
 
 ## Части реализации
 
-- [ ] **Part 1**: Базовые абстракции (BaseEnv, BaseDynamicalSystem)
-- [ ] **Part 2**: DifferentialDriveEnv (RL среда)
-- [ ] **Part 3**: Номинальная политика (move-to-point)
-- [ ] **Part 4**: DifferentialDriveSystem (физика для визуализации)
-- [ ] **Part 5**: OrientedAgent (визуализация cone)
-- [ ] **Part 6**: Интеграция VectorizedEnv + Config
-- [ ] **Part 7**: Интеграция main.py + CriticHeatmap
-- [ ] **Part 8**: Финальное тестирование
+- [x] **Part 1**: Базовые абстракции (BaseEnv, BaseDynamicalSystem)
+- [x] **Part 2**: DifferentialDriveEnv (RL среда)
+- [x] **Part 3**: Номинальная политика (move-to-point)
+- [x] **Part 4**: DifferentialDriveSystem (физика для визуализации)
+- [x] **Part 5**: OrientedAgent (визуализация cone)
+- [x] **Part 6**: Интеграция VectorizedEnv + Config
+- [x] **Part 7**: Интеграция main.py + CriticHeatmap
+- [x] **Part 8**: Финальное тестирование
 
 ---
 
@@ -27,7 +27,7 @@
 ## Part 1: Базовые абстракции
 
 **Приоритет**: КРИТИЧЕСКИЙ (блокирует Part 2-4)
-**Статус**: Pending
+**Статус**: ✅ ЗАВЕРШЁН
 **Файлы**: `RL/base_env.py`, рефакторинг `RL/simple_env.py`
 
 ### Задачи
@@ -127,9 +127,9 @@ py -3.12 -c "from RL.simple_env import PointMassEnv; e = PointMassEnv(); print(e
 ```
 
 ### Критерии успеха
-- [ ] BaseEnv создан
-- [ ] PointMassEnv наследуется от BaseEnv
-- [ ] Тест регрессии проходит
+- [x] BaseEnv создан
+- [x] PointMassEnv наследуется от BaseEnv
+- [x] Тест регрессии проходит
 
 ---
 

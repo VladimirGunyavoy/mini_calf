@@ -10,5 +10,16 @@ from .point_trail import PointTrail
 from .line_trail import LineTrail
 from .critic_heatmap import CriticHeatmap
 from .grid_overlay import GridOverlay
+from .oriented_agent import OrientedAgent
 
-__all__ = ['PointVisual', 'GeneralObject', 'SimpleTrail', 'MultiColorTrail', 'PointTrail', 'LineTrail', 'CriticHeatmap', 'GridOverlay']
+__all__ = [
+    'PointVisual', 
+    'GeneralObject', 
+    'SimpleTrail', 
+    'MultiColorTrail', 
+    'PointTrail', 
+    'LineTrail', 
+    'CriticHeatmap', 
+    'GridOverlay',
+    'OrientedAgent',
+]

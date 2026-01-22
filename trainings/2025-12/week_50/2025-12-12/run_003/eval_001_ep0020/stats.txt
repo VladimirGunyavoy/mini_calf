@@ -1,0 +1,20 @@
+Evaluation #1
+Episode: 20/300
+
+CALF Statistics:
+  Total Steps: 21856
+  Nominal Interventions: 2234
+  Relax Events: 19621
+  P_relax: 0.8036663425
+  Intervention Rate: 0.1022
+  Relax Rate: 0.8977
+
+Training Statistics:
+  Trajectories in buffer: 10
+  Last 20 Avg Reward: -4844.65
+  Last 20 Avg Length: 905
+  Last 20 Avg Distance: 12.6145
+
+Model:
+  Saved to: model.pth
+  Also saved: model_calf.npz (CALF parameters)

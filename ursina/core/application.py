@@ -15,6 +15,7 @@ from managers import (
 )
 from physics import VectorizedEnvironment
 from RL.simple_env import PointMassEnv
+from RL.differential_drive_env import DifferentialDriveEnv
 
 
 class CALFApplication:
@@ -124,22 +125,47 @@ class CALFApplication:
             print(f"GPU: {torch.cuda.get_device_name(0)}")
             print(f"CUDA Version: {torch.version.cuda}")
 
-    def create_training_env(self):
+    def create_training_env(self, system_type: str = None):
         """
         Factory method to create training environment.
 
+        Parameters:
+        -----------
+        system_type : str, optional
+            'point_mass' or 'differential_drive'. If None, uses config.
+
         Returns:
         --------
-        PointMassEnv
+        BaseEnv
             Training environment instance
         """
-        env = PointMassEnv(dt=0.01, max_action=5.0, goal_radius=0.1)
-        print(f"\nEnvironment: PointMassEnv")
+        if system_type is None:
+            system_type = self.config.training.system_type
+
+        if system_type == 'point_mass':
+            env = PointMassEnv(
+                dt=0.01, 
+                max_action=5.0, 
+                goal_radius=self.config.training.goal_epsilon
+            )
+            print(f"\nEnvironment: PointMassEnv")
+        elif system_type == 'differential_drive':
+            env = DifferentialDriveEnv(
+                dt=0.01,
+                max_v=self.config.training.max_v,
+                max_omega=self.config.training.max_omega,
+                goal_radius=self.config.training.goal_epsilon,
+                goal_angle_tolerance=self.config.training.goal_angle_tolerance
+            )
+            print(f"\nEnvironment: DifferentialDriveEnv")
+        else:
+            raise ValueError(f"Unknown system type: {system_type}")
+
         print(f"State dim: {env.state_dim}, Action dim: {env.action_dim}")
         print(f"Max action: {env.max_action}, Goal radius: {env.goal_radius}")
         return env
 
-    def create_visual_envs(self, n_agents):
+    def create_visual_envs(self, n_agents, system_type: str = None):
         """
         Factory method to create visual environments.
 
@@ -147,14 +173,31 @@ class CALFApplication:
         -----------
         n_agents : int
             Number of visual agents/environments
+        system_type : str, optional
+            'point_mass' or 'differential_drive'. If None, uses config.
 
         Returns:
         --------
-        list[PointMassEnv]
+        list[BaseEnv]
             List of visual environment instances
         """
-        visual_envs = [PointMassEnv(dt=0.01, max_action=5.0, goal_radius=0.1)
-                      for _ in range(n_agents)]
+        if system_type is None:
+            system_type = self.config.training.system_type
+
+        if system_type == 'point_mass':
+            visual_envs = [PointMassEnv(dt=0.01, max_action=5.0, 
+                                        goal_radius=self.config.training.goal_epsilon)
+                          for _ in range(n_agents)]
+        elif system_type == 'differential_drive':
+            visual_envs = [DifferentialDriveEnv(
+                dt=0.01,
+                max_v=self.config.training.max_v,
+                max_omega=self.config.training.max_omega,
+                goal_radius=self.config.training.goal_epsilon,
+                goal_angle_tolerance=self.config.training.goal_angle_tolerance
+            ) for _ in range(n_agents)]
+        else:
+            raise ValueError(f"Unknown system type: {system_type}")
 
         # Reset all environments
         for ve in visual_envs:

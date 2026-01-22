@@ -87,11 +87,12 @@ class CALFTrainer:
         reward = reward * self.config.reward_scale
 
         # Check early termination
-        distance = np.linalg.norm(next_state)
+        distance = np.linalg.norm(next_state[:2]) if len(next_state) >= 2 else np.linalg.norm(next_state)
         position = abs(next_state[0])
 
         if distance < self.config.goal_epsilon:
             done = True
+            info['in_goal'] = True  # Update in_goal flag
         elif position > self.config.boundary_limit:
             done = True
         elif self.episode_length >= self.config.max_steps_per_episode:
@@ -179,7 +180,8 @@ class CALFTrainer:
 
     def _save_checkpoint(self):
         """Save training checkpoint."""
-        checkpoint_path = Path("checkpoints") / f"calf_episode_{self.episode}.pth"
+        system_type = getattr(self.config, 'system_type', 'unknown')
+        checkpoint_path = Path("checkpoints") / f"calf_{system_type}_episode_{self.episode}.pth"
         checkpoint_path.parent.mkdir(exist_ok=True)
         self.calf_agent.save(str(checkpoint_path))
         print(f"  Checkpoint saved: {checkpoint_path}")
@@ -209,8 +211,9 @@ class CALFTrainer:
         print(f"  Intervention rate: {calf_stats['intervention_rate']:.3f}")
         print(f"  Relax rate: {calf_stats['relax_rate']:.3f}")
 
-        # Save final model
-        final_path = Path("trained_calf_final.pth")
+        # Save final model (with system_type in filename)
+        system_type = getattr(self.config, 'system_type', 'unknown')
+        final_path = Path(f"trained_calf_{system_type}.pth")
         self.calf_agent.save(str(final_path))
         print(f"\nFinal model saved: {final_path}")
 
